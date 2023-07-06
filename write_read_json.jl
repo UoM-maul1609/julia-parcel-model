@@ -26,3 +26,13 @@ dict2=JSON.parse(json_string,dicttype=Dict,inttype=Int64)
 # print both dictionaries
 println(dict1)
 println(dict2)
+
+
+
+# read some other data
+
+json_string = read("example.json", String)
+dict3=JSON.parse(json_string,dicttype=Dict,inttype=Int64)
+
+# print the dictionary
+println(dict3)
