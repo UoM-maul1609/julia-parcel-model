@@ -1,0 +1,66 @@
+run_vars:     
+    outputfile: /tmp/output1.nc
+    runtime: 7000.
+    dt: 10.
+    zinit: 450.
+    winit: 2.5
+    tinit: 280.
+    pinit: 90000.
+    rhinit: 0.95
+    vent_flag: 1
+    kappa_flag: 1 # note, 0 for standard, 1 for kappa-koehler
+    alpha_therm: 1.0
+    alpha_cond: 1.0
+    alpha_therm_ice: 1.0
+    alpha_dep: 1.0
+
+aerosol_setup:
+    n_mode: 1
+    n_intern: 3
+    n_sv: 10
+    sv_flag: 0
+    n_bins: 60
+    n_comps: 4
+
+aerosol_spec:
+    n_aer1:
+        -   - 2.27e9
+            - 3.08e9
+            - 1.05e9
+    d_aer1:
+        -   - 13e-9
+            - 32e-9
+            - 123e-9
+    sig_aer1:
+        -   - 0.66
+            - 0.69
+            - 0.54
+    dmina:  10.e-9
+    dmaxa:  3.e-6
+    mass_frac_aer1:
+        -   [1.,1.,1.]
+        -   [0.,0.,0.]
+        -   [0.,0.,0.]
+        -   [0.,0.,0.]
+    molw_core1:
+        [132.14e-3, 132.14e-3, 132.14e-3, 132.14e-3]
+    density_core1:
+        [1770., 1770., 1770., 1770.]
+    nu_core1:
+        [3., 3., 3., 3.]
+    kappa_core1:
+        [ 0.3, 0.2, 0.2, 0.3]
+    org_content1: 
+        [0.005,0.01,0.02,0.03,0.06,0.08,0.16,0.3,0.42,0.8]
+    molw_org1:
+        [200.e-3,200.e-3,200.e-3,200.e-3,200.e-3,200.e-3,200.e-3,200.e-3,200.e-3,200.e-3]
+    kappa_org1:
+        [1.e-1,1.e-1,1.e-1,1.e-1,1.e-1,1.e-1,1.e-1,1.e-1,1.e-1,1.e-1]
+    density_org1:
+        [1500,1500,1500,1500,1500,1500,1500,1500,1500,1500]
+    delta_h_vap1:
+        [150,150,150,150,150,150,150,150,150,150]
+    nu_org1:
+        [1,1,1,1,1,1,1,1,1,1]
+    log_c_star1:
+        [-6.,-5.,-4.,-3.,-2.,-1.,0.,1.,2.,3.]

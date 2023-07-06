@@ -1,0 +1,24 @@
+{
+	"runvars": {
+		"outputfile": "/tmp/output1.nc",
+		"runtime": 7200. ,
+		"dt":10. ,
+		"zinit": 450.,
+		"winit": 2.5,
+		"tinit": 280.,
+		"pinit": 90000.,
+		"rhinit": 0.95, 
+		"kappa_flag": 1,
+		"alpha_therm": 1.0,
+		"alpha_cond": 1.0,
+		"alpha_therm_ice": 1.0,
+		"alpha_dep": 1.0
+	},
+	"aerosol_setup": {
+		"n_mode": 1,
+		"n_intern": 3,
+		"n_sv":10,
+		"sv_flag":0
+	}
+	
+}
