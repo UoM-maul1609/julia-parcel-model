@@ -8,6 +8,7 @@ run_vars:
     pinit: 90000.
     rhinit: 0.95
     vent_flag: 1
+    ice_flag: 1
     kappa_flag: 1 # note, 0 for standard, 1 for kappa-koehler
     alpha_therm: 1.0
     alpha_cond: 1.0

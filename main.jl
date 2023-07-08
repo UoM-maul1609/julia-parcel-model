@@ -6,8 +6,8 @@
 import YAML
 
 # Read the namelist data
-namelist_data = YAML.load_file(ARGS[1])
-# namelist_data = YAML.load_file("namelist.yml")
+#namelist_data = YAML.load_file(ARGS[1])
+namelist_data = YAML.load_file("namelist.yml")
 
 # Import the driver
 include("bin_microphysics_module.jl")
