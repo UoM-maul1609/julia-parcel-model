@@ -1,10 +1,31 @@
 module bmm
     using SpecialFunctions
     using Roots
+    using Optim
+
     
     export bmm_driver, initialise_bmm_arrays
     
-    ttr=273.15
+    const r_gas=8.314
+    const molw_a=29.e-3
+    const molw_water=18.e-3
+    const cp1=1005.0
+    const cpv=1870.0
+    const cpw=4.27e3
+    const cpi=2104.6 
+    const grav=9.81 
+    const lv=2.5e6
+    const ls1=2.837e6
+    const lf=ls1-lv
+    const ttr=273.15
+    const joules_in_an_erg=1.0e-7
+    const joules_in_a_cal=4.187e0 
+    const rhow=1000.
+    const ra=r_gas/molw_a
+    const rv=r_gas/molw_water  
+    const eps1=ra/rv
+    const rhoice=910.0
+    const oneThird=1.0/3.0
     
     function bmm_driver(data)
         println("Running the driver...")
@@ -45,6 +66,7 @@ module bmm
         global nu_core1     = data["aerosol_spec"]["nu_core1"]
         global molw_core1   = data["aerosol_spec"]["molw_core1"]
         global kappa_core1  = data["aerosol_spec"]["kappa_core1"]
+        global kappa_flag   = data["run_vars"]["kappa_flag"]
         
         global d            = zeros(Float64,n_bin_mode1)
         global mbinedges    = zeros(Float64,n_bins+1,n_modes)
@@ -160,12 +182,143 @@ module bmm
             end
         end
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        global qinit = rh*eps1*svp_liq(t)/(p-svp_liq(t))
+        
+        #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        put water on bin, using koehler equation
+        note that julia lacks a switch statement
+        =# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        global n_sel = 1
+        global rh_act=0.0
+        global mult=-1.0
+        if(kappa_flag == 0) 
+            for i=1:n_bin_modew
+                n_sel = i;rh_act=0.0;mult=-1.0
+                
+                # find the peak of koehler curve: optimisation
+                a=optimize(koehler02, [0.0],Optim.Options(x_abstol=1e0,f_abstol=1e-30))
+                test1=Optim.minimizer(a)[1] #xmin
+                
+                rh_act=min(rh,0.999)
+                mult=1.0
+                # now optimise / root find
+                d_dummy = find_zero(koehler02, (1.e-50,test1))*molw_water
 
+                mbin[i,n_comps+1] = d_dummy 
+            end
+        elseif(kappa_flag == 1)
+            for i=1:n_bin_modew
+                n_sel = i;rh_act=0.0;mult=-1.0
+                
+                # find the peak of koehler curve: optimisation
+                a=optimize(kkoehler02, [0.0],Optim.Options(x_abstol=1e0,f_abstol=1e-30))
+                test1=Optim.minimizer(a)[1] #xmin
+                
+                rh_act=min(rh,0.999)
+                mult=1.0
+                # now optimise / root find
+                d_dummy = find_zero(kkoehler02, (1.e-50,test1))*molw_water
+
+                mbin[i,n_comps+1] = d_dummy 
+            end
+        
+        else
+            exit()
+        end
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
 
     end
     
     
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        surface tension of water - pruppacher and klett
+        in: t - temperature
+        return: surface tension of water
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function surface_tension(t)	
+
+        tc=t-ttr
+        tc = max(tc,-40.)
+
+        # pruppacher and klett pg 130 
+        surface_tension = 75.93 + 0.115 * tc + 6.818e-2 * tc^2 + 
+                          6.511e-3 * tc^3 + 2.933e-4 * tc^4 + 
+                          6.283e-6 * tc^5 + 5.285e-8 * tc^6
+        if(tc>=0.) 
+            surface_tension = 76.1 - 0.155*tc
+        end 
     
+        surface_tension = surface_tension*joules_in_an_erg # convert to j/cm2 
+        surface_tension = surface_tension*1.e4 # convert to j/m2 
+
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    
+    
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        koehler equation: this is coded so it can be called with a root-finder, 
+        to find the inverse
+        in: moles of water
+        out: RH
+        note there are some dummy variables set within the module
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function koehler02(nw)
+        
+        massw   = nw[1]*molw_water
+        rhoat   = massw/rhow + sum(mbin[n_sel,1:n_comps] / rhobin[n_sel,1:n_comps])
+        rhoat   = (massw+maer[n_sel])/rhoat
+        dw      = ((massw+maer[n_sel])*6.0/(pi*rhoat))^(oneThird)
+        
+        # calculate surface tension of water
+        sigma   = surface_tension(t)
+        
+        # equilibrium rh over particle - nb rh_act set to zero if not root-finding
+        
+        return mult*(exp(4.0*molw_water*sigma/r_gas/t/rhoat/dw)* 
+               (nw[1])/(nw[1]+sum(mbin[n_sel,1:n_comps]/ 
+               molwbin[n_sel,1:n_comps] * 
+               nubin[n_sel,1:n_comps]) ))-rh_act
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        kappa-koehler equation: this is coded so it can be called with a root-finder, 
+        to find the inverse
+        in: moles of water
+        out: RH
+        note there are some dummy variables set within the module
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function kkoehler02(nw)
+        
+        massw   = nw[1]*molw_water
+        rhoat   = massw/rhow + sum(mbin[n_sel,1:n_comps] / rhobin[n_sel,1:n_comps])
+        rhoat   = (massw+maer[n_sel])/rhoat
+        dw      = ((massw+maer[n_sel])*6.0/(pi*rhoat))^(oneThird)
+        
+        # calculate surface tension of water
+        sigma   = surface_tension(t)
+        
+        dd=(sum(mbin[n_sel,1:n_comps] ./ rhobin[n_sel,1:n_comps])* 
+          6.0/(pi))^oneThird # dry diameter
+                                  # needed for eqn 6, petters and kreidenweis (2007)
+
+        kappa=sum(mbin[n_sel,1:n_comps] ./ rhobin[n_sel,1:n_comps] .*  
+                kappabin[n_sel,1:n_comps]) / 
+                sum(mbin[n_sel,1:n_comps] ./ rhobin[n_sel,1:n_comps])
+               # equation 7, petters and kreidenweis (2007)
+
+        # equilibrium rh over particle - nb rh_act set to zero if not root-finding
+        return mult*(exp(4.0*molw_water*sigma/r_gas/t/rhoat/dw)* 
+           (dw^3-dd^3)/(dw^3-dd^3*(1.0-kappa)))-rh_act
+           # eq 6 petters and kreidenweis (acp, 2007)
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
     
     
     
