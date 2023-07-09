@@ -2,6 +2,7 @@ module bmm
     using SpecialFunctions
     using Roots
     using Optim
+    using NetCDF
 
     
     export bmm_driver, initialise_bmm_arrays
@@ -33,6 +34,9 @@ module bmm
         # number of time-steps
         nt::Int16 = ceil(data["run_vars"]["runtime"] / bmm.dt)
         for i=1:nt
+            # output to file
+            output(new_file,outputfile)
+        
             #println("Time-step $i of $nt time in seconds is $(i * bmm.dt)")
             bin_microphysics()
         end
@@ -67,6 +71,8 @@ module bmm
         global molw_core1   = data["aerosol_spec"]["molw_core1"]
         global kappa_core1  = data["aerosol_spec"]["kappa_core1"]
         global kappa_flag   = data["run_vars"]["kappa_flag"]
+        global new_file     = [true]
+        global outputfile   = data["run_vars"]["outputfile"]
         
         global d            = zeros(Float64,n_bin_mode1)
         global mbinedges    = zeros(Float64,n_bins+1,n_modes)
@@ -508,4 +514,70 @@ module bmm
         #println(dt)
     end
     
+    
+    
+    
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       output 1 time-step of the model
+       in: new_file, outputfile
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function output(new_file,outputfile)
+
+        if new_file[1]
+            if isfile(outputfile)
+                rm(outputfile)
+            end
+            new_file[1] = false
+
+
+            tdim = NcDim("times",0,unlimited=true)
+            xdim = NcDim("nbins",n_bins)
+            ydim = NcDim("nmodes",n_modes)
+            zdim = NcDim("ncomps",n_comps)
+
+            #uvar = NcVar("u",[xdim,ydim,tdim],t=Float32)
+            # define variable: time
+            tvar = NcVar("time",tdim,t=Float32)
+            tvar.atts = Dict("units" => "seconds")
+            
+            # define variable: z
+            zvar = NcVar("z",tdim,t=Float32)
+            zvar.atts = Dict("units" => "m")
+            
+            # define variable: p
+            pvar = NcVar("p",tdim,t=Float32)
+            pvar.atts = Dict("units" => "Pa")
+            
+            # define variable: t
+            ttvar = NcVar("t",tdim,t=Float32)
+            ttvar.atts = Dict("units" => "K")
+            
+            # define variable: rh
+            rhvar = NcVar("rh",tdim,t=Float32)
+            rhvar.atts = Dict("units" => "n/a")
+            
+            # define variable: w
+            wvar = NcVar("w",tdim,t=Float32)
+            wvar.atts = Dict("units" => "m s-1")
+
+            # fn=tempname()
+            global ncu = NetCDF.create(outputfile,
+                [tvar,zvar,pvar,ttvar,rhvar,wvar],mode=NC_NETCDF4)
+
+            #NetCDF.sync(ncu)
+            global io_count=1
+        end
+
+        NetCDF.putvar(ncu,"time",[bmm.dt],start=[io_count]) #Write the time
+        NetCDF.putvar(ncu,"z",[bmm.z],start=[io_count])
+        NetCDF.putvar(ncu,"p",[bmm.p],start=[io_count])
+        NetCDF.putvar(ncu,"t",[bmm.t],start=[io_count])
+        NetCDF.putvar(ncu,"rh",[bmm.rh],start=[io_count])
+        NetCDF.putvar(ncu,"w",[bmm.w],start=[io_count])
+        # NetCDF.sync(ncu)
+        io_count += 1
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
 end
