@@ -256,6 +256,64 @@ module bmm
     end 
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        koehler equation: equilibrium humidity over a particle
+        in: t,mwat,mbin,rhobin,nubin,molwbin,,
+        out: RH, rhoat, dw
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function koehler01(t,mwat,mbin,rhobin,nubin,molwbin)
+        
+        nw      = mwat ./ molw_water
+        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)
+        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],2))./rhoat
+        dw      = ((mwat .+sum(mbin[:,1:n_comps],2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
+        
+        # calculate surface tension of water
+        sigma   = surface_tension(t)
+        
+        # equilibrium rh over particle - nb rh_act set to zero if not root-finding
+        
+        return exp(4.0*molw_water*sigma/r_gas/t/rhoat/dw)* 
+               (nw)/(nw+sum(mbin[:,1:n_comps]/ 
+               molwbin[:,1:n_comps] * 
+               nubin[:,1:n_comps],2) )
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        kappa-koehler equation: equilibrium humidity over a particle
+        in: t,mwat,mbin,rhobin,nubin,molwbin,,
+        out: RH, rhoat, dw
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function kkoehler01(t,mwat,mbin,rhobin,nubin,molwbin)
+        
+        nw      = mwat ./ molw_water
+        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)
+        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],2))./rhoat
+        dw      = ((mwat .+sum(mbin[:,1:n_comps],2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
+        
+        # calculate surface tension of water
+        sigma   = surface_tension(t)
+        
+        dd=(sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)* 
+          6.0/(pi))^oneThird # dry diameter
+                                  # needed for eqn 6, petters and kreidenweis (2007)
+
+        kappa=sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps] .*  
+                kappabin[:,1:n_comps],2) / 
+                sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)
+               # equation 7, petters and kreidenweis (2007)
+
+        # equilibrium rh over particle - nb rh_act set to zero if not root-finding
+        return exp(4.0 .* molw_water .* sigma ./ r_gas ./ t ./ rhoat ./dw) .* 
+           (dw.^3-dd.^3) ./ (dw.^3-dd.^3 .* (1.0 .-kappa))
+           # eq 6 petters and kreidenweis (acp, 2007)
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
     
     #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         koehler equation: this is coded so it can be called with a root-finder, 
@@ -309,6 +367,70 @@ module bmm
         kappa=sum(mbin[n_sel,1:n_comps] ./ rhobin[n_sel,1:n_comps] .*  
                 kappabin[n_sel,1:n_comps]) / 
                 sum(mbin[n_sel,1:n_comps] ./ rhobin[n_sel,1:n_comps])
+               # equation 7, petters and kreidenweis (2007)
+
+        # equilibrium rh over particle - nb rh_act set to zero if not root-finding
+        return mult*(exp(4.0*molw_water*sigma/r_gas/t/rhoat/dw)* 
+           (dw^3-dd^3)/(dw^3-dd^3*(1.0-kappa)))-rh_act
+           # eq 6 petters and kreidenweis (acp, 2007)
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        koehler equation: this is coded so it can be called with a root-finder, 
+        to find the inverse
+        in: moles of water
+        out: RH - but called via root-finder so mbin is returned
+        note there are some dummy variables set within the module
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function koehler03(mbin)
+        
+        nw   = d_dummy*molw_water
+        rhoat   = d_dummy/rhow + mbin[1]*sum(mass_frac_aer1[n_sel,1:n_comps] / 
+                density_core1[1:n_comps])
+        rhoat   = (d_dummy+mbin[1])/rhoat
+        dw      = ((d_dummy+mbin[1])*6.0/(pi*rhoat))^(oneThird)
+        
+        # calculate surface tension of water
+        sigma   = surface_tension(t)
+        
+        # equilibrium rh over particle - nb rh_act set to zero if not root-finding
+        
+        return mult*(exp(4.0*molw_water*sigma/r_gas/t/rhoat/dw)* 
+               (nw)/(nw+mbin[1]*sum(mass_frac_aer1[n_sel,1:n_comps]/ 
+               molw_core1[1:n_comps] * 
+               nu_core1[1:n_comps]) ))-rh_act
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        kappa-koehler equation: this is coded so it can be called with a root-finder, 
+        to find the inverse
+        in: moles of water
+        out: RH - but called via root-finder so mbin is returned
+        note there are some dummy variables set within the module
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function kkoehler03(nw)
+        
+        nw   = d_dummy*molw_water
+        rhoat   = d_dummy/rhow + mbin[1]*sum(mass_frac_aer1[n_sel,1:n_comps] / 
+                density_core1[1:n_comps])
+        rhoat   = (d_dummy+mbin[1])/rhoat
+        dw      = ((d_dummy+mbin[1])*6.0/(pi*rhoat))^(oneThird)
+        
+        # calculate surface tension of water
+        sigma   = surface_tension(t)
+        
+        dd=(sum(mbin[1]*mass_frac_aer1[n_sel,1:n_comps] ./ density_core1[n_sel,1:n_comps])* 
+          6.0/(pi))^oneThird # dry diameter
+                                  # needed for eqn 6, petters and kreidenweis (2007)
+
+        kappa=sum(mbin[1]*mass_frac_aer1[n_sel,1:n_comps] ./ density_core1[1:n_comps] .*  
+                kappa_core1[1:n_comps]) / 
+                sum(mbin[1]*mass_frac_aer1[n_sel,1:n_comps] ./ density_core1[1:n_comps])
                # equation 7, petters and kreidenweis (2007)
 
         # equilibrium rh over particle - nb rh_act set to zero if not root-finding
