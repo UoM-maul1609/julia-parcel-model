@@ -3,7 +3,7 @@ module bmm
     using Roots
     using Optim
     using NetCDF
-
+    using OrdinaryDiffEq
     
     export bmm_driver, initialise_bmm_arrays
     
@@ -36,7 +36,7 @@ module bmm
         nt::Int16 = ceil(data["run_vars"]["runtime"] / bmm.dt)
         for i=1:nt
             # output to file
-            output(new_file,outputfile)
+            output!(new_file,outputfile)
         
             #println("Time-step $i of $nt time in seconds is $(i * bmm.dt)")
             bin_microphysics()
@@ -111,6 +111,9 @@ module bmm
         global fv       = zeros(Float64,n_bin_modew)
         global fh       = zeros(Float64,n_bin_modew)
         
+        global iz       = 1
+        global ipr      = 2
+        global itr      = 3
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
@@ -501,7 +504,7 @@ module bmm
         note there are some dummy variables set within the module
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function kkoehler03(nw)
+    function kkoehler03(mbin)
         
         nw   = d_dummy*molw_water
         rhoat   = d_dummy/rhow + mbin[1]*sum(mass_frac_aer1[n_sel,1:n_comps] / 
@@ -639,7 +642,7 @@ module bmm
        inout: rhobin,dw
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function wetdiam(mwat,mbin,rhobin,dw)
+    function wetdiam!(mwat,mbin,rhobin,dw)
         
         # calculate the diameter and radius
         rhoat[:] = mwat[:] ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
@@ -658,7 +661,7 @@ module bmm
        in: diam, rhoat, t, p: diameter, density, temperature and pressure
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function terminal01(vel,diam,rhoat,t,p,nre,cd1)
+    function terminal01!(vel,diam,rhoat,t,p,nre,cd1)
         tc=t-ttr
         vel[:] .= 0.0 # zero array
         rhoa    = p / (ra * t) # density of air
@@ -731,7 +734,7 @@ module bmm
        in: diam, rhoat, t, p: diameter, density, temperature and pressure
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function ventilation01(vel,nre,cd1,diam,rhoat,t,p,fv,fh)
+    function ventilation01!(vel,nre,cd1,diam,rhoat,t,p,fv,fh)
         # density of air
         rhoa = p/ra/t
         # diffusivity of water vapour in air
@@ -747,7 +750,7 @@ module bmm
         nsc2 = nu / k1
 
         # terminal velocity of water drops
-        terminal01(vel,diam,rhoat, t,p,nre,cd1)
+        terminal01!(vel,diam,rhoat, t,p,nre,cd1)
 
         # mass ventilation - use dv+++++++++
         calc = (nsc1.^(oneThird)) .* sqrt.(nre)
@@ -778,7 +781,7 @@ module bmm
        in: t,p, rh, rh_eq
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function dropgrowthrate01(vel,nre,cd1,diam,rhoat,t,p,fv,fh,rh,rh_eq)
+    function dropgrowthrate01!(vel,nre,cd1,diam,rhoat,t,p,fv,fh,rh,rh_eq)
         rad=diam .* 0.5
         # density of air
         rhoa=p/ra/t
@@ -790,7 +793,7 @@ module bmm
         fv[:] .= 1.0
         fh[:] .= 1.0
         if(vent_flag == 1)
-            ventilation01(vel,nre,cd1,diam,rhoat,t,p,fv,fh)
+            ventilation01!(vel,nre,cd1,diam,rhoat,t,p,fv,fh)
         end
 
         # modify diffusivity and conductivity
@@ -809,19 +812,26 @@ module bmm
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
     
-    #=
-        ~~1. terminal~~
-        ~~2. ventilation~~
-        ~~3. drop growth~~
-        4. parcelwarm
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       fparcelwarm
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
+    function fparcelwarm!(ydot,y,p1,t)
+        p = y[ipr]
+        t = y[itr]
+        ydot[iz] = w
+        ydot[ipr] = -p/ra/t/grav*ydot[iz]
+        ydot[itr] = 0.0
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
     
     function bin_microphysics()
 
-        wetdiam(mbin[:,n_comps+1],mbin,rhobin,dw)
-        terminal01(vel,dw,rhobin,t,p,nre,cd1)
-        ventilation01(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
+        #=
+        wetdiam!(mbin[:,n_comps+1],mbin,rhobin,dw)
+        terminal01!(vel,dw,rhobin,t,p,nre,cd1)
+        ventilation01!(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
             dw[1:n_bin_modew],rhobin[1:n_bin_modew],t,p,fv,fh)
         if kappa_flag==0
             rh_eq[:]=koehler01(t,mbin[:,n_comps+1],mbin,rhobin,nubin,molwbin)
@@ -831,8 +841,15 @@ module bmm
             println("No kappa flag")
             exit()
         end        
-        dropgrowthrate01(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
+        dropgrowthrate01!(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
             dw[1:n_bin_modew],rhoat[1:n_bin_modew],t,p,fv,fh,rh,rh_eq)
+        =#
+        
+        tspan=(0,dt)
+        u0=[z,p,t]
+        prob = ODEProblem(fparcelwarm!, u0, tspan)
+        sol = solve(prob, FBDF(), abstol=1.e-2,reltol=1.e-15)
+        println(sol.u[end])
     end
     
     
@@ -843,7 +860,7 @@ module bmm
        in: new_file, outputfile
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function output(new_file,outputfile)
+    function output!(new_file,outputfile)
 
         if new_file[1]
             if isfile(outputfile)
