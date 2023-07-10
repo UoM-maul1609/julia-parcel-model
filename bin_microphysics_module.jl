@@ -27,6 +27,7 @@ module bmm
     const eps1=ra/rv
     const rhoice=910.0
     const oneThird=1.0/3.0
+    const oneSixth=1.0/6.0
     
     function bmm_driver(data)
         println("Running the driver...")
@@ -71,8 +72,11 @@ module bmm
         global molw_core1   = data["aerosol_spec"]["molw_core1"]
         global kappa_core1  = data["aerosol_spec"]["kappa_core1"]
         global kappa_flag   = data["run_vars"]["kappa_flag"]
+        global vent_flag    = data["run_vars"]["vent_flag"]
         global new_file     = [true]
         global outputfile   = data["run_vars"]["outputfile"]
+        global alpha_cond   = data["run_vars"]["alpha_cond"]
+        global alpha_therm  = data["run_vars"]["alpha_therm"]
         
         global d            = zeros(Float64,n_bin_mode1)
         global mbinedges    = zeros(Float64,n_bins+1,n_modes)
@@ -85,7 +89,7 @@ module bmm
 
         global momtemp      = zeros(Float64,n_bin_mode)
         global moments      = zeros(Float64,n_bin_mode,n_comps+imoms)
-        global momenttype   = zeros(Float64,n_comps+imoms)
+        global momenttype   = zeros(Int16,n_comps+imoms)
 
         global rhobin   = zeros(Float64,n_bin_modew,n_comps)
         global nubin    = zeros(Float64,n_bin_modew,n_comps)
@@ -100,8 +104,13 @@ module bmm
 
         global ecoal    = zeros(Float64,n_bin_mode,n_bin_mode)
         global ecoll    = zeros(Float64,n_bin_mode,n_bin_mode)
-        global indexc   = zeros(Float64,n_bin_mode,n_bin_mode)
-        global vel      = zeros(Float64,n_bin_mode,n_bin_mode)
+        global indexc   = zeros(Int32,n_bin_mode,n_bin_mode)
+        global vel      = zeros(Float64,n_bin_mode)
+        global nre      = zeros(Float64,n_bin_mode)
+        global cd1      = zeros(Float64,n_bin_mode)
+        global fv       = zeros(Float64,n_bin_modew)
+        global fh       = zeros(Float64,n_bin_modew)
+        
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
@@ -231,8 +240,81 @@ module bmm
         else
             exit()
         end
+        moments[:] .= 0.0
+        for j=1:n_comps
+            for i=1:n_bin_modew
+                moments[i,j]=npart[i]*mbin[i,j] 
+            end
+        end
+        momenttype[1:n_comps] .= 1
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
         
+        #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        ice stuff now
+        =# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        if ice_flag == 1
+            global dice         = zeros(Float64,n_bin_mode1)
+            global maerice      = zeros(Float64,n_bin_modew)
+            global npartice     = zeros(Float64,n_bin_modew)
+            global mbinice      = zeros(Float64,n_bin_modew,n_comps+1)
+            global rho_coreice  = zeros(Float64,n_modes)
+
+            global rhobinice    = zeros(Float64,n_bin_modew,n_comps)
+            global nubinice     = zeros(Float64,n_bin_modew,n_comps)
+            global molwbinice   = zeros(Float64,n_bin_modew,n_comps)
+            global kappabinice  = zeros(Float64,n_bin_modew,n_comps)
+
+            global rh_eqice     = zeros(Float64,n_bin_modew)
+            global rhoatice     = zeros(Float64,n_bin_modew)
+            global dwice        = zeros(Float64,n_bin_modew)
+            global da_dtice     = zeros(Float64,n_bin_modew)
+            global nice         = zeros(Float64,n_bin_modew)
+
+            global phi          = zeros(Float64,n_bin_modew)
+            global rhoi         = zeros(Float64,n_bin_modew)
+            global nump         = zeros(Float64,n_bin_modew)
+            global rime         = zeros(Float64,n_bin_modew)
+            
+            phi[:]  .= 1.0
+            rhoi[:] .= rhoice
+            nump[:] .= 1.0
+            rime[:] .= 0.0
+            
+            rho_coreice[:]  = rho_core[:]
+            npartice[:]     .= 0.0
+            dice[:]         = d
+            maerice[:]      = maer[:]
+            mbinice[:,:]    = mbin[:,:]
+            rhobinice[:,:]  = rhobin[:,:]
+            nubinice[:,:]   = nubin[:,:]
+            molwbinice[:,:] = molwbin[:,:]
+            kappabinice[:,:]= kappabin[:,:]
+            
+            for j=1:n_comps
+                for i=1:n_bin_modew
+                    moments[i+n_bin_modew,j]=npartice[i]*mbinice[i,j] 
+                end
+            end
+            
+            # extra ice moments
+            for i=1:n_bin_modew
+                # ice moments: phi, nmon, vol, rim, unfr
+                # phi: 1*n
+                moments[i+n_bin_modew,n_comps+1]    = npartice[i]
+                # nmon: 1*n
+                moments[i+n_bin_modew,n_comps+2]    = npartice[i]
+                # vol: mass/rho
+                moments[i+n_bin_modew,n_comps+3]    = npartice[i]
+                # rim: mass
+                moments[i+n_bin_modew,n_comps+4]    = npart[i] * mbin[i,n_comps+1]
+                # unf: mass
+                moments[i+n_bin_modew,n_comps+5]    = npart[i] * mbin[i,n_comps+1]
+            end
+            momenttype[n_comps+1:n_comps+imoms]     = [2,2,1,1,1]
+        end
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
     end
     
@@ -271,19 +353,19 @@ module bmm
     function koehler01(t,mwat,mbin,rhobin,nubin,molwbin)
         
         nw      = mwat ./ molw_water
-        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)
-        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],2))./rhoat
-        dw      = ((mwat .+sum(mbin[:,1:n_comps],2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
+        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
+        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],dims=2))./rhoat
+        dw      = ((mwat .+sum(mbin[:,1:n_comps],dims=2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
         
         # calculate surface tension of water
         sigma   = surface_tension(t)
         
         # equilibrium rh over particle - nb rh_act set to zero if not root-finding
         
-        return exp(4.0*molw_water*sigma/r_gas/t/rhoat/dw)* 
-               (nw)/(nw+sum(mbin[:,1:n_comps]/ 
-               molwbin[:,1:n_comps] * 
-               nubin[:,1:n_comps],2) )
+        return exp.(4.0.*molw_water.*sigma./r_gas./t./rhoat./dw).* 
+               (nw)./(nw.+sum(mbin[:,1:n_comps] ./ 
+               molwbin[:,1:n_comps] .* 
+               nubin[:,1:n_comps],dims=2) )
     end
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -296,24 +378,24 @@ module bmm
     function kkoehler01(t,mwat,mbin,rhobin,nubin,molwbin)
         
         nw      = mwat ./ molw_water
-        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)
-        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],2))./rhoat
-        dw      = ((mwat .+sum(mbin[:,1:n_comps],2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
+        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
+        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],dims=2))./rhoat
+        dw      = ((mwat .+sum(mbin[:,1:n_comps],dims=2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
         
         # calculate surface tension of water
         sigma   = surface_tension(t)
         
-        dd=(sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)* 
-          6.0/(pi))^oneThird # dry diameter
+        dd=(sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2).* 
+          6.0./(pi)).^oneThird # dry diameter
                                   # needed for eqn 6, petters and kreidenweis (2007)
 
         kappa=sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps] .*  
-                kappabin[:,1:n_comps],2) / 
-                sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],2)
+                kappabin[:,1:n_comps],dims=2) ./ 
+                sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
                # equation 7, petters and kreidenweis (2007)
 
         # equilibrium rh over particle - nb rh_act set to zero if not root-finding
-        return exp(4.0 .* molw_water .* sigma ./ r_gas ./ t ./ rhoat ./dw) .* 
+        return exp.(4.0 .* molw_water .* sigma ./ r_gas ./ t ./ rhoat ./dw) .* 
            (dw.^3-dd.^3) ./ (dw.^3-dd.^3 .* (1.0 .-kappa))
            # eq 6 petters and kreidenweis (acp, 2007)
     end
@@ -508,10 +590,249 @@ module bmm
     end
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       diffusivity of water vapour in air
+       in: t, p
+       out: dd - diffusivity of water vapour in air
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function dd1(t,p)
+        t1 = max(t,200.0)
+        return 2.11e-5.*(t1./ttr).^1.94.*(101325.0/p)
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       thermal conductivity of air
+       in: t
+       out: ka - thermal conductivity of air
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function ka(t)
+        t1=max(t,200.0)
+        return (5.69+0.017.*(t1-ttr)).*1.e-3 .*joules_in_a_cal
+    end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    
+    
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       viscosity of air
+       in: t
+       out: viscosity_air - viscosity of air
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function viscosity_air(t)
+        tc = t-ttr
+        tc = max(tc,-200.0)
+
+        if( tc >= 0.0) 
+            return (1.718+0.0049*tc) * 1e-5 # the 1d-5 converts from poise to si units
+        else
+            return (1.718+0.0049*tc-1.2e-5*tc^2) * 1e-5
+        end 
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       calculate the wet diameter
+       in: mwat,mbin
+       inout: rhobin,dw
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function wetdiam(mwat,mbin,rhobin,dw)
+        
+        # calculate the diameter and radius
+        rhoat[:] = mwat[:] ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
+        rhoat[:] = (mwat[:] .+ sum(mbin[:,1:n_comps],dims=2)) ./ rhoat[:]
+        
+        # wet diameter
+        dw[:] = ((mwat[:] .+ sum(mbin[:,1:n_comps],dims=2)) .*6.0 ./(pi .*rhoat[:])).^oneThird
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       calculate the terminal velocity of cloud drops
+       see pruppacher and klett
+       inout: vel, nre, cd: terminal velocity, reynolds number and drag coefficeint
+       in: diam, rhoat, t, p: diameter, density, temperature and pressure
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function terminal01(vel,diam,rhoat,t,p,nre,cd1)
+        tc=t-ttr
+        vel[:] .= 0.0 # zero array
+        rhoa    = p / (ra * t) # density of air
+        diam2   =diam # temporary array that can be changed
+
+        eta1    = viscosity_air(t)
+
+        nre[:] .= 0.0 # zero array
+        ind     = findall(diam2 .> 7000.e-6)
+        diam2[ind] .= 7000.e-6
+        mass    =pi/6.0.*diam2 .^3 .* rhoat
+    
+        sigma = surface_tension(t)
+        
+        # regime 3:  eqns 5-12, 10-146 & 10-148 from p & k 
+        physnum = (sigma^3.0) * (rhoa^2) / ((eta1^4.0) * grav * (rhow - rhoa))		
+        phys6 = physnum^(oneSixth)
+        ind=findall(diam2 .> 1070.e-6) 
+        bondnum = (4.0 .* oneThird) .* grav .* (rhow - rhoa) .* (diam2[ind].^2) ./ sigma
+
+        x = log.(bondnum .* phys6)
+        y = -5.00015 .+ 5.23778 .* x .- 2.04914 .* x .* x .+ 0.475294 .* (x .^ 3) 
+            .- 0.542819e-1 .* (x.^4.0) .+ 0.238449e-2 .* (x.^5)
+
+        nre[ind] = phys6 .* exp.(y)
+
+        vel[ind] = eta1 * (nre[ind])/ (rhoa * diam2[ind])
+
+        cd1[ind] = 8.0 .* mass[ind] .* grav .* rhoa./(pi .* ((diam2[ind] .* 0.5).* eta1).^2)
+        cd1[ind] = cd1[ind]	./ (nre[ind].^2) 
+
+
+
+
+
+        # regime 2:  eqns 10-142, 10-145 & 10-146 from p & k 
+        ind=findall((diam2 .<= 1070.e-6) .& (diam2 .> 20.e-6))
+        bestnm = 32.0 .* ((diam2[ind] .*0.5).^3) .* (rhow - rhoa) .* rhoa * 
+                  grav ./ (3.0 .* eta1.^2)
+        x = log.(bestnm)
+        y = -3.18657 .+ 0.992696 .* x .- 0.153193e-2 .* x .* x 
+            .- 0.987059e-3 .* (x.^3) .- 0.578878e-3 .* (x.^4) 
+            .+ 0.855176e-4 .* (x.^5) .- 0.327815e-5 .* (x.^6)
+        nre[ind] =  exp.(y)
+        vel[ind] = eta1 .* nre[ind] ./ (2.0 .* rhoa .* (diam2[ind] .* 0.5))
+        cd1[ind] = bestnm ./(nre[ind].^2)
+
+
+
+        # regime 1:  eqns 10-138, 10-139 & 10-140 from p & k 
+        mfpath = 6.6e-8 * (101325.0 / p) * (t / 293.15)
+        ind=findall(diam2 .<= 20.e-6) 
+        vel[ind] = 2.0 .* ((diam2[ind] .*0.5).^2) .* grav .* (rhow - rhoa) ./ (9.0 .* eta1)
+        vel[ind] = vel[ind] .* (1.0 .+ 1.26 .* mfpath ./ (diam2[ind] .* 0.5))
+        nre[ind] = vel[ind] .* rhoa .* diam2[ind] ./ eta1
+
+        cd1[ind] = 8.0 .* mass[ind] .* grav .* rhoa./(pi .* ((diam2[ind] ./ 2.0).* eta1).^2)
+        cd1[ind] = cd1[ind]	./ (nre[ind].^2) 
+
+
+        ind=findall(isnan.(vel))
+        vel[ind] .=0.0
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       ventilation factor for water drops
+       inout: fv,fh: ventilation factors for vapour and heat
+       inout: vel,nre,cd1: vel, reynolds, drag coeffient
+       in: diam, rhoat, t, p: diameter, density, temperature and pressure
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function ventilation01(vel,nre,cd1,diam,rhoat,t,p,fv,fh)
+        # density of air
+        rhoa = p/ra/t
+        # diffusivity of water vapour in air
+        d1 = dd1(t,p)
+        # conductivity of air
+        k1 = ka(t)
+        # viscosity of air
+        eta1=viscosity_air(t)
+        # kinematic viscosity
+        nu = eta1 / rhoa
+        # schmitt numbers:
+        nsc1 = nu / d1
+        nsc2 = nu / k1
+
+        # terminal velocity of water drops
+        terminal01(vel,diam,rhoat, t,p,nre,cd1)
+
+        # mass ventilation - use dv+++++++++
+        calc = (nsc1.^(oneThird)) .* sqrt.(nre)
+        ind=findall(calc .> 51.4)
+        calc[ind] .= 51.4
+
+        ind=findall(calc .< 1.4)
+        fv[ind]=1.00 .+0.108.*calc[ind].^2
+        ind=findall(calc .>= 1.4)
+        fv[ind]=0.78 .+0.308.*calc[ind]
+        #-----------------------------------
+
+        # heat ventilation - use ka---------
+        calc = (nsc2.^(oneThird)) .* sqrt.(nre)
+        ind=findall(calc .> 51.4)
+        calc[ind] .=51.4
+
+        ind=findall(calc .< 1.4)
+        fh[ind]=1.00 .+0.108 .*calc[ind].^2
+        fh[ind]=0.78 .+0.308 .*calc[ind]
+        #-----------------------------------
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       calculate growth rate of a cloud droplet by diffusional growth
+       inout: vel, nre, cd1, fv, fh
+       in: t,p, rh, rh_eq
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
+    function dropgrowthrate01(vel,nre,cd1,diam,rhoat,t,p,fv,fh,rh,rh_eq)
+        rad=diam .* 0.5
+        # density of air
+        rhoa=p/ra/t
+        # diffusivity of water vapour in air
+        d1=dd1(t,p)
+        # thermal conductivity of air
+        k1=ka(t)
+        # ventilation coefficient
+        fv[:] .= 1.0
+        fh[:] .= 1.0
+        if(vent_flag == 1)
+            ventilation01(vel,nre,cd1,diam,rhoat,t,p,fv,fh)
+        end
+
+        # modify diffusivity and conductivity
+        dstar =d1.*fv./(rad./(rad.+0.7*8.e-8).+d1.*fv./rad./alpha_cond.*sqrt(2.0*pi/rv/t))
+        kstar =k1.*fh./(rad./(rad.+2.16e-7).+
+            k1.*fh./rad./alpha_therm./cp1./rhoa.*sqrt(2.0*pi/ra/t))
+
+        # 455 jacobson and 511 pruppacher and klett
+        dropgrowthrate01=dstar.*lv.*rh_eq.*svp_liq(t).* 
+                       rhoat./kstar./t.*(lv.*molw_water./t./r_gas.-1.0) 
+        dropgrowthrate01=dropgrowthrate01.+rhoat*r_gas*t/molw_water  
+        dropgrowthrate01=dstar.*(rh.-rh_eq).*svp_liq(t)./rad./dropgrowthrate01
+
+        return dropgrowthrate01
+    end 
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    
+    #=
+        ~~1. terminal~~
+        ~~2. ventilation~~
+        ~~3. drop growth~~
+        4. parcelwarm
+    =#
+    
     
     function bin_microphysics()
-        #println(myvariable)
-        #println(dt)
+
+        wetdiam(mbin[:,n_comps+1],mbin,rhobin,dw)
+        terminal01(vel,dw,rhobin,t,p,nre,cd1)
+        ventilation01(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
+            dw[1:n_bin_modew],rhobin[1:n_bin_modew],t,p,fv,fh)
+        if kappa_flag==0
+            rh_eq[:]=koehler01(t,mbin[:,n_comps+1],mbin,rhobin,nubin,molwbin)
+        elseif kappa_flag==1
+            rh_eq[:]=kkoehler01(t,mbin[:,n_comps+1],mbin,rhobin,nubin,molwbin)
+        else
+            println("No kappa flag")
+            exit()
+        end        
+        dropgrowthrate01(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
+            dw[1:n_bin_modew],rhoat[1:n_bin_modew],t,p,fv,fh,rh,rh_eq)
     end
     
     
