@@ -37,6 +37,7 @@ module bmm
         nt::Int16 = ceil(data["run_vars"]["runtime"] / bmm.dt)
         for i=1:nt
             # output to file
+            bmm.time1=(i-1)*dt
             output!(new_file,outputfile)
         
             #println("Time-step $i of $nt time in seconds is $(i * bmm.dt)")
@@ -57,6 +58,7 @@ module bmm
         global w            =data["run_vars"]["winit"]
         global rh           =data["run_vars"]["rhinit"]
         global dt           =data["run_vars"]["dt"]
+        global time1        = 0.0
         global n_bins       = data["aerosol_setup"]["n_bins"]
         global n_modes      = data["aerosol_setup"]["n_mode"]
         global n_comps      = data["aerosol_setup"]["n_comps"]
@@ -974,7 +976,7 @@ module bmm
             global io_count=1
         end
 
-        NetCDF.putvar(ncu,"time",[bmm.dt],start=[io_count]) #Write the time
+        NetCDF.putvar(ncu,"time",[bmm.time1],start=[io_count]) #Write the time
         NetCDF.putvar(ncu,"z",[bmm.z],start=[io_count])
         NetCDF.putvar(ncu,"p",[bmm.p],start=[io_count])
         NetCDF.putvar(ncu,"t",[bmm.t],start=[io_count])
