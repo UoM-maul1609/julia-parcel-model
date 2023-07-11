@@ -4,6 +4,7 @@ module bmm
     using Optim
     using NetCDF
     using OrdinaryDiffEq
+    using ForwardDiff
     
     export bmm_driver, initialise_bmm_arrays
     
@@ -111,9 +112,10 @@ module bmm
         global fv       = zeros(Float64,n_bin_modew)
         global fh       = zeros(Float64,n_bin_modew)
         
-        global iz       = 1
-        global ipr      = 2
-        global itr      = 3
+        global iz       = n_bin_modew+1
+        global ipr      = n_bin_modew+2
+        global itr      = n_bin_modew+3
+        global irh      = n_bin_modew+4
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
@@ -253,6 +255,15 @@ module bmm
         # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
+
+        #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        liquid bins and variables
+        =# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        global u0 = zeros(n_bin_modew+4)
+        u0[1:n_bin_modew]=mbin[:,n_comps+1]
+        u0[n_bin_modew+1:n_bin_modew+4]= [z,p,t,rh]
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
         
         #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         ice stuff now
@@ -353,12 +364,12 @@ module bmm
         out: RH, rhoat, dw
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function koehler01(t,mwat,mbin,rhobin,nubin,molwbin)
+    function koehler01!(t,mwat,mbin,rhobin,nubin,molwbin,rhoat,dw)
         
         nw      = mwat ./ molw_water
-        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
-        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],dims=2))./rhoat
-        dw      = ((mwat .+sum(mbin[:,1:n_comps],dims=2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
+        rhoat[:]   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
+        rhoat[:]   = (mwat .+ sum(mbin[:,1:n_comps],dims=2))./rhoat
+        dw[:]      = ((mwat .+sum(mbin[:,1:n_comps],dims=2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
         
         # calculate surface tension of water
         sigma   = surface_tension(t)
@@ -378,12 +389,12 @@ module bmm
         out: RH, rhoat, dw
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
-    function kkoehler01(t,mwat,mbin,rhobin,nubin,molwbin)
+    function kkoehler01!(t,mwat,mbin,rhobin,nubin,molwbin,rhoat,dw)
         
         nw      = mwat ./ molw_water
-        rhoat   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
-        rhoat   = (mwat .+ sum(mbin[:,1:n_comps],dims=2))./rhoat
-        dw      = ((mwat .+sum(mbin[:,1:n_comps],dims=2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
+        rhoat[:]   = mwat ./ rhow .+ sum(mbin[:,1:n_comps] ./ rhobin[:,1:n_comps],dims=2)
+        rhoat[:]   = (mwat .+ sum(mbin[:,1:n_comps],dims=2))./rhoat
+        dw[:]      = ((mwat .+sum(mbin[:,1:n_comps],dims=2)) .* 6.0 ./(pi.*rhoat)).^(oneThird)
         
         # calculate surface tension of water
         sigma   = surface_tension(t)
@@ -817,40 +828,96 @@ module bmm
        !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     =#
     function fparcelwarm!(ydot,y,p1,t)
+        # local variables
+        wv=0.0;wl=0.0;wi=0.0;drv=0.0;dri=0.0;dri2=0.0;
+
+        # initialise and assign vars
+        ydot[:] .= 0.0
         p = y[ipr]
         t = y[itr]
-        ydot[iz] = w
-        ydot[ipr] = -p/ra/t/grav*ydot[iz]
-        ydot[itr] = 0.0
+        rh=y[irh]
+        
+        # check there are no negative values
+        ind=findall(y[1:n_bin_modew] .<= 0.0)
+        y[ind] .= 1.e-22
+        
+        # calculate mixing ratios from rh, etc
+        sl=svp_liq(t)*rh/(p-svp_liq(t)) # saturation ratio
+        sl=(sl*p/(1.0+sl))/svp_liq(t)
+        wv=eps1*rh*svp_liq(t) / (p-svp_liq(t))  # vapour mixing ratio
+        wl=sum(npart .* y[1:n_bin_modew])       # liquid mixing ratio
+        
+        # calculate the moist gas constants and specific heats
+        rm1 = ra +wv*rv
+        cpm=cp1+wv*cpv+wl*cpw+wi*cpi
+        
+        # now calculate derivatives
+        # adiabatic parcel model
+        ydot[iz] = w                        # vertical wind
+        ydot[ipr] = -p/rm1/t*grav*ydot[iz]  # hydrostatic equation
+
+        # calculate the equilibrium rhs
+        if kappa_flag==0
+            rh_eq[:]=koehler01!(t,y[1:n_bin_modew],mbin,rhobin,nubin,molwbin,rhoat,dw)
+        elseif kappa_flag==1
+            rh_eq[:]=kkoehler01!(t,y[1:n_bin_modew],mbin,rhobin,nubin,molwbin,rhoat,dw)
+        else
+            println("Whoops!")
+            exit()
+        end
+        
+        # particle growth rate - radius growth rate
+        da_dt=dropgrowthrate01!(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
+            dw[1:n_bin_modew],rhoat[1:n_bin_modew],t,p,fv,fh,rh,rh_eq)
+        # do not bother if number concentration too small
+        ind=findall( isnan.(da_dt) .| (npart[:] .<= 1.e-9))    
+        da_dt[ind] .= 0.0
+        
+        # mass growth rate
+        ydot[1:n_bin_modew] = pi .* rhoat .* dw.^2 .*da_dt
+        # change in vapour content
+        drv = -sum(ydot[1:n_bin_modew] .* npart[:])
+        
+        #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            change in temperature of the parcel
+           !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        =#
+        ydot[itr] = rm1/p*ydot[ipr]*t/cpm  # temperature change: expansion
+        ydot[itr] = ydot[itr]-lv/cpm*drv   # temperature change: condensation
+        #  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
+        #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            change in rh of the parcel
+           !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        =#
+        ydot[irh] = (p-svp_liq(t))*svp_liq(t)*drv
+        ydot[irh] = ydot[irh]+svp_liq(t)*wv*ydot[ipr]
+        ydot[irh] = ydot[irh]-wv*p*ydot[itr]*ForwardDiff.derivative(svp_liq,t)
+        ydot[irh] = ydot[irh] / (eps1*svp_liq(t)^2)
+        #  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
     end 
     # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
     
+    #= !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       bin_microphysics model, solves the ode over one time-step
+       !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    =#
     function bin_microphysics()
 
-        #=
-        wetdiam!(mbin[:,n_comps+1],mbin,rhobin,dw)
-        terminal01!(vel,dw,rhobin,t,p,nre,cd1)
-        ventilation01!(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
-            dw[1:n_bin_modew],rhobin[1:n_bin_modew],t,p,fv,fh)
-        if kappa_flag==0
-            rh_eq[:]=koehler01(t,mbin[:,n_comps+1],mbin,rhobin,nubin,molwbin)
-        elseif kappa_flag==1
-            rh_eq[:]=kkoehler01(t,mbin[:,n_comps+1],mbin,rhobin,nubin,molwbin)
-        else
-            println("No kappa flag")
-            exit()
-        end        
-        dropgrowthrate01!(vel[1:n_bin_modew],nre[1:n_bin_modew],cd1[1:n_bin_modew],
-            dw[1:n_bin_modew],rhoat[1:n_bin_modew],t,p,fv,fh,rh,rh_eq)
-        =#
-        
         tspan=(0,dt)
-        u0=[z,p,t]
         prob = ODEProblem(fparcelwarm!, u0, tspan)
-        sol = solve(prob, FBDF(), abstol=1.e-2,reltol=1.e-15)
-        println(sol.u[end])
+        sol = solve(prob, FBDF(autodiff=false), abstol=1.e-2,reltol=1.e-15)
+        u0[:]=sol.u[end]
+        
+        global p = u0[ipr]
+        global t = u0[itr]
+        global rh= u0[irh]
+        global z = u0[iz]
+        
     end
+    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
     
     
