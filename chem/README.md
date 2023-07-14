@@ -3,10 +3,11 @@
 Jobs initial:
 
 1. Fork copy of mechanism solver from JlBox
-2. Set up pre-conditioner
-3. Plot basic output
-4. Add all helper functions
-5. Add Adjoint using auto-diff
+2. Use existing parser for chemical mechanism
+3. Set up pre-conditioner
+4. Plot basic output
+5. Add all helper functions
+6. Add Adjoint using auto-diff
 
 Jobs later:
 
