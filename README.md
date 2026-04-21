@@ -1,7 +1,7 @@
 # Julia Parcel Model
 
 
-Aim is to create a 'simple' model is Julia and then explore machine learning approaches to solve the differential equations. The neural network can be trained on the ODE data
+Aim is to create a 'simple' model is Julia and then explore machine learning approaches to solve the differential equations. The neural network can be trained on the ODE data.
 
 See this paper [here](https://arxiv.org/pdf/1902.02376.pdf)
 
