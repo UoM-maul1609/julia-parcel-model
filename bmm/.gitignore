@@ -1,0 +1,15 @@
+*.o
+*.mod
+*.a
+*.so
+*.exe
+*~
+doxygen
+matlab/radial_function.m
+references
+namelist.andreas
+namelist.run
+*.dSYM
+__pycache__/
+.DS_Store
+
