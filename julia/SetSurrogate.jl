@@ -50,12 +50,31 @@ physical_target(y) = (
 # weights and N_total, making the representation invariant to splitting an
 # otherwise identical lognormal mode into duplicate submodes.
 function _mode_features(c::MLCase)
-    reduce(hcat, (Float32[
-        log(max(c.mode_Dm[j], 1f-12) / DM_SCALE),
-        (c.mode_lnsig[j] - 0.5f0) / 0.25f0,
+    # These are fixed input data, not trainable quantities. Build each row
+    # functionally and reshape to 3 x nmode so the one-mode case retains its
+    # mode axis without using `stack` (whose implementation mutates internally).
+    nmode = length(c.mode_N)
+    dm = Float32[
+        log(max(c.mode_Dm[j], 1f-12) / DM_SCALE)
+        for j in 1:nmode
+    ]
+    sig = Float32[
+        (c.mode_lnsig[j] - 0.5f0) / 0.25f0
+        for j in 1:nmode
+    ]
+    kap = Float32[
         (c.mode_kappa[j] - 0.5f0) / 0.5f0
-    ] for j in eachindex(c.mode_N)))
+        for j in 1:nmode
+    ]
+    vcat(reshape(dm, 1, :),
+         reshape(sig, 1, :),
+         reshape(kap, 1, :))
 end
+
+# Mode properties are fixed training inputs. Zygote should differentiate
+# through encoder(_mode_features(c)) with respect to the encoder parameters,
+# but not through construction of the input feature matrix itself.
+Zygote.@nograd _mode_features
 
 function aerosol_context(encoder, c::MLCase)
     ntot = sum(c.mode_N)
