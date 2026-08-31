@@ -466,15 +466,18 @@ bmm/                              BMM upstream source at subtree prefix
 julia/BMM.jl                      multimode BMM namelist/process interface
 julia/SyntheticDataset.jl         synthetic design + NetCDF writer
 julia/generate_synthetic_dataset.jl
-julia/NeuralODESurrogate.jl       current single-mode baseline surrogate
-julia/example_generate_and_train.jl
+julia/SurrogateData.jl            trajectory loader + leakage-safe split
+julia/SetSurrogate.jl             variable-mode set encoder + profile/Neural ODE models
+julia/analyse_dataset.jl          ensemble coverage diagnostics
+julia/train_surrogate.jl          profile or Neural ODE training
+julia/compare_surrogates.jl       held-out comparison on the same split
 julia/smoke.jl                    two-mode BMM/Julia smoke test
 scripts/bmm-subtree.sh            git-subtree helper
 ```
 
-The current `NeuralODESurrogate.jl` is retained as a single-mode baseline. The
-next training change should replace its fixed aerosol context with a
-permutation-invariant mode-set encoder before training on the multimode file.
+The old fixed-context single-mode surrogate has been removed so it cannot be
+used accidentally with the multimode dataset. Both current models use the same
+permutation-invariant variable-mode encoder.
 
 ## BMM subtree
 
@@ -544,3 +547,179 @@ A failed case can then be reproduced directly from the repository root with:
 
 (adjust the path if the dataset was written elsewhere). The saved namelist is
 the exact input used in the failed ensemble run.
+
+
+## Frozen BMM truth-model baseline for surrogate generation
+
+The BMM source included in this revision contains the warm/ice DVODE recovery
+policy established during the synthetic stress tests:
+
+```text
+particle liquid/ice mass ATOL = 1e-25 kg
+DVODE MXSTEP per call          = 100
+maximum recovery restarts      = 100
+recover ISTATE -1 or -5        = restart from last accepted state with ISTATE=1
+```
+
+The same recovery rule is used for liquid condensation/evaporation and ice
+deposition/sublimation. The physical growth equations are not changed by the
+recovery policy. `fparcelwarm` also initializes the complete RHS (`ydot`) on
+every call, and prescribed updraft type 3 uses `ydot(iw)` rather than modifying
+DVODE's state vector from inside the RHS callback.
+
+This is the truth-model baseline for the first surrogate dataset and should not
+be changed while comparing surrogate architectures, otherwise the target model
+would move during training experiments.
+
+## First surrogate-training workflow
+
+Once `synthetic_bmm.nc` has been generated successfully, freeze the BMM truth
+configuration for this stage and work entirely in `julia/`.
+
+### 1. Diagnose the synthetic ensemble
+
+From the repository root:
+
+```bash
+make analyse-dataset
+```
+
+or directly:
+
+```bash
+cd julia
+julia --project=. analyse_dataset.jl synthetic_bmm.nc
+```
+
+The analysis reports distributions of cloud-base conditions, total aerosol
+number, maximum supersaturation, maximum/final cloud-drop number, activated
+fraction, extinction, liquid water and effective diameter. It also writes
+`synthetic_bmm_case_summary.csv` for plotting or further inspection.
+
+The activated-fraction histogram is especially useful before increasing the
+ensemble size: the pilot should contain substantial numbers of partially
+activated cases, rather than almost all cases lying at either zero or complete
+activation.
+
+### 2. Variable-number-of-modes representation
+
+The ML models do **not** receive a padded fixed four-mode vector. Each real
+mode is processed by the same encoder using its intensive properties
+
+```text
+log(Dm), ln(sigma), kappa_eff
+```
+
+where `kappa_eff` is the supplied kappa for kappa-Koehler data; the loader can
+also derive the ideal classical-Koehler equivalent from `nu`, molecular weight
+and dry density if kappa is absent.
+
+For mode `i`, the shared encoder produces `phi_i`. These are pooled with number
+fraction weights:
+
+```text
+Ntot = sum_i N_i
+E_aer = sum_i (N_i/Ntot) phi_i
+```
+
+and `log(Ntot)` is supplied separately. The representation is therefore:
+
+- invariant to the ordering of aerosol modes;
+- able to accept a different number of modes without changing network size;
+- exactly invariant to splitting one mode into two identical modes whose
+  concentrations sum to the original concentration.
+
+This is important when climate-model modal decompositions differ for numerical
+rather than physical reasons.
+
+### 3. Train/test split
+
+`train_surrogate.jl` splits by **complete BMM trajectory**, never by height
+point. The default split is approximately 70% training, 15% validation and 15%
+test, stratified by aerosol mode count. `training_split.csv` records the
+original BMM case number assigned to each split.
+
+This prevents profile points from one BMM simulation leaking between training
+and test datasets.
+
+### 4. Direct profile control model
+
+Train this first because it is inexpensive and tests the set encoder and data
+pipeline without an ODE solve inside every optimization step:
+
+```bash
+make train-profile
+```
+
+or:
+
+```bash
+cd julia
+julia --project=. train_surrogate.jl synthetic_bmm.nc profile 100 20260831
+```
+
+It predicts transformed profiles of
+
+```text
+S(z), Nd(z), beta_ext(z)
+```
+
+from the aerosol set, cloud-base `T`, `P`, constant `w`, and height above cloud
+base. The resulting model is saved as `profile_surrogate.bson`.
+
+### 5. Neural ODE
+
+Then train the main continuous-height model:
+
+```bash
+make train-neuralode
+```
+
+or, for an initial short debug run:
+
+```bash
+cd julia
+julia --project=. train_surrogate.jl synthetic_bmm.nc neuralode 5 20260831
+```
+
+The Neural ODE integrates in normalized **height above cloud base**, not time.
+Its initial state is predicted from the aerosol/environment context; it does
+not use the BMM target at `z=0`, so there is no truth leakage at inference.
+The default first run is 30 epochs and saves `neuralode_surrogate.bson`.
+
+For the present dataset `w` is constant. It is kept as a separate forcing
+feature so a later dataset can replace it by `w(z)` without redesigning the
+aerosol set encoder.
+
+### 6. Compare models on exactly the same held-out cases
+
+After both models exist:
+
+```bash
+make compare-surrogates
+```
+
+The reported metrics include supersaturation RMSE in percentage points and
+log-space RMSEs for cloud-drop number and extinction. The direct profile model
+is a control: keep the Neural ODE only if its continuous-state structure gives
+useful validation/test performance or extrapolation benefits.
+
+### Recommended progression
+
+For the first successful 256-case dataset:
+
+```bash
+make analyse-dataset
+make train-profile
+cd julia
+julia --project=. train_surrogate.jl synthetic_bmm.nc neuralode 5 20260831
+```
+
+Use the 5-epoch Neural ODE run only to verify differentiation and solver
+stability. If it works, increase to 30 epochs. Once the complete pipeline is
+sound, generate roughly 2,000 BMM cases, retrain, and use held-out error to
+decide where additional BMM sampling is most valuable.
+
+`ql`, `deff`, and mode-resolved `Dcrit` remain in the NetCDF dataset but are not
+primary v1 training targets. They are retained for diagnostics and for the
+later existing-cloud-water / accelerated-updraft extension.
