@@ -12,7 +12,7 @@ using NCDatasets
 
 export AerosolMode, BMMCase, cloud_base_case, effective_kappa,
        default_bmm_exe, run_bmm, run_bmm_batch, derive_dcrit,
-       resample_profile, to_namelist, case_diagnostics
+       resample_profile, dry_air_density, to_namelist, case_diagnostics
 
 const MOLW_WATER = 18.01528e-3
 const RHO_WATER = 1000.0
@@ -230,7 +230,7 @@ end
 # Match BMM's output conversion from #/kg dry air to #/m3.
 _svp_liq(T) = 100.0 * 6.1121 * exp((18.678 - (T - 273.15) / 234.5) *
                                     (T - 273.15) / (257.14 + (T - 273.15)))
-function _dry_air_density(p, T, rh)
+function dry_air_density(p, T, rh)
     Ra = 8.314 / 29e-3
     Rv = 8.314 / 18e-3
     eps = Ra / Rv
@@ -259,7 +259,7 @@ function _read_output(ncpath::AbstractString, c::BMMCase)
                                       c.modes[im].density)
     end
 
-    rhod = [_dry_air_density(vals.p[i], vals.T[i], vals.rh[i]) for i in 1:nt]
+    rhod = [dry_air_density(vals.p[i], vals.T[i], vals.rh[i]) for i in 1:nt]
     (t=vals.t,
      height=vals.z .- vals.z[1],
      z=vals.z,
@@ -403,6 +403,7 @@ function resample_profile(r; dz::Float64=5.0, height_top::Float64=r.height[end])
      w=interp(r.w),
      S=interp(r.S),
      ndrop=interp(r.ndrop),
+     ndrop_kg=interp(r.ndrop_kg),
      beta_ext=interp(r.beta_ext),
      ql=interp(r.ql),
      deff=interp(r.deff),

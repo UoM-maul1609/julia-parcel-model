@@ -52,11 +52,18 @@ function _choose_class(rng)
     findfirst(x -> u <= x, CLASS_CDF)::Int
 end
 
-"""Return `(mode, class_id)` for one synthetic aerosol mode."""
+"""Return `(spec, class_id)` for one synthetic aerosol mode.
+
+`spec.Ncm` is sampled as a physical cloud-base volume concentration in cm^-3.
+It is converted to BMM's required number mixing ratio (# kg^-1 dry air) only
+after cloud-base T and P are known.
+"""
 function _sample_mode(rng)
     cls = _choose_class(rng)
 
-    # N ranges are in cm^-3 here for readability and converted to m^-3 below.
+    # N ranges are specified in cm^-3 because that is the most intuitive way
+    # to define the synthetic physical aerosol population. BMM itself expects
+    # n_aer1 as # kg^-1 dry air, so conversion happens in sample_cases().
     # Overlap in Dm between adjacent classes is intentional: real modal
     # decompositions overlap and the network should not rely on class identity.
     if cls == 1                 # nucleation / ultrafine
@@ -90,11 +97,17 @@ function _sample_mode(rng)
         _uniform(rng, 1.00, 1.40)
     end
 
-    # Density cancels out of ideal kappa-Koehler activation for a supplied dry
-    # diameter; keep a benign fixed value for BMM's dry mass bookkeeping.
-    mode = AerosolMode(N=Ncm * 1e6, Dm=Dm, lnsig=lnsig, kappa=kappa,
-                       nu=3.0, molw=132.14e-3, density=1770.0)
-    mode, cls
+    spec = (Ncm=Ncm, Dm=Dm, lnsig=lnsig, kappa=kappa,
+            nu=3.0, molw=132.14e-3, density=1770.0)
+    spec, cls
+end
+
+function _bmm_mode(spec, rhod_cb)
+    rhod_cb > 0 || throw(ArgumentError("cloud-base dry-air density must be positive"))
+    # cm^-3 -> m^-3 -> # kg^-1 dry air
+    Nkg = spec.Ncm * 1e6 / rhod_cb
+    AerosolMode(N=Nkg, Dm=spec.Dm, lnsig=spec.lnsig, kappa=spec.kappa,
+                nu=spec.nu, molw=spec.molw, density=spec.density)
 end
 
 function _sample_cloud_base(rng, cfg::SamplingConfig)
@@ -132,13 +145,17 @@ function sample_cases(cfg::SamplingConfig)
     shuffle!(rng, counts)
 
     for nm in counts
-        modes = AerosolMode[]
+        specs = NamedTuple[]
         cls = Int[]
         for _ in 1:nm
-            m, c = _sample_mode(rng)
-            push!(modes, m)
+            spec, c = _sample_mode(rng)
+            push!(specs, spec)
             push!(cls, c)
         end
+
+        T0, P0 = _sample_cloud_base(rng, cfg)
+        rhod_cb = BMM.dry_air_density(P0, T0, 1.0)
+        modes = AerosolMode[_bmm_mode(spec, rhod_cb) for spec in specs]
 
         # Sorting is only for deterministic storage/readability. A downstream
         # set encoder should still be permutation invariant.
@@ -146,7 +163,6 @@ function sample_cases(cfg::SamplingConfig)
         modes = modes[order]
         cls = cls[order]
 
-        T0, P0 = _sample_cloud_base(rng, cfg)
         w = _loguniform(rng, cfg.w_min, cfg.w_max)
         push!(cases, cloud_base_case(
             winit=w,
@@ -172,7 +188,13 @@ function summarise_cases(cases::Vector{BMMCase})
     Ts = getfield.(cases, :tinit)
     Ps = getfield.(cases, :pinit)
     allmodes = reduce(vcat, getfield.(cases, :modes))
-    Ns = getfield.(allmodes, :N) ./ 1e6
+    # Convert BMM's # kg^-1 input back to the sampled physical concentration
+    # at cloud base for human-readable diagnostics.
+    Ns = Float64[]
+    for c in cases
+        rhod_cb = BMM.dry_air_density(c.pinit, c.tinit, c.rhinit)
+        append!(Ns, [m.N * rhod_cb / 1e6 for m in c.modes])
+    end
     Ds = getfield.(allmodes, :Dm) .* 1e9
     sig = getfield.(allmodes, :lnsig)
     kap = getfield.(allmodes, :kappa)
@@ -181,7 +203,7 @@ function summarise_cases(cases::Vector{BMMCase})
     println("  w: $(minimum(ws))-$(maximum(ws)) m s^-1")
     println("  cloud-base T: $(minimum(Ts))-$(maximum(Ts)) K")
     println("  cloud-base P: $(minimum(Ps)/100)-$(maximum(Ps)/100) hPa")
-    println("  mode N: $(minimum(Ns))-$(maximum(Ns)) cm^-3")
+    println("  mode N at cloud base: $(minimum(Ns))-$(maximum(Ns)) cm^-3")
     println("  mode Dm: $(minimum(Ds))-$(maximum(Ds)) nm")
     println("  mode lnsig: $(minimum(sig))-$(maximum(sig))")
     println("  mode kappa: $(minimum(kap))-$(maximum(kap))")
@@ -212,8 +234,10 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
     T0 = [c.tinit for c in cases]
     P0 = [c.pinit for c in cases]
     w0 = [c.winit for c in cases]
+    rhod0 = [BMM.dry_air_density(c.pinit, c.tinit, c.rhinit) for c in cases]
 
-    mode_N = fill(NaN, ncase, maxm)
+    mode_N = fill(NaN, ncase, maxm)            # # kg^-1 dry air (BMM input)
+    mode_N_cb = fill(NaN, ncase, maxm)         # m^-3 at cloud base, diagnostic
     mode_Dm = fill(NaN, ncase, maxm)
     mode_lnsig = fill(NaN, ncase, maxm)
     mode_kappa = fill(NaN, ncase, maxm)
@@ -224,6 +248,7 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
 
     S = fill(NaN, ncase, nh)
     Nd = fill(NaN, ncase, nh)
+    Nd_kg = fill(NaN, ncase, nh)
     beta = fill(NaN, ncase, nh)
     ql = fill(NaN, ncase, nh)
     deff = fill(NaN, ncase, nh)
@@ -233,6 +258,7 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         c = cases[i]
         for (j, m) in enumerate(c.modes)
             mode_N[i, j] = m.N
+            mode_N_cb[i, j] = m.N * rhod0[i]
             mode_Dm[i, j] = m.Dm
             mode_lnsig[i, j] = m.lnsig
             mode_kappa[i, j] = m.kappa
@@ -252,6 +278,7 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         success[i] = 1
         S[i, :] .= _nearest_profile(q, hgrid, :S)
         Nd[i, :] .= _nearest_profile(q, hgrid, :ndrop)
+        Nd_kg[i, :] .= _nearest_profile(q, hgrid, :ndrop_kg)
         beta[i, :] .= _nearest_profile(q, hgrid, :beta_ext)
         ql[i, :] .= _nearest_profile(q, hgrid, :ql)
         deff[i, :] .= _nearest_profile(q, hgrid, :deff)
@@ -278,8 +305,10 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         defVar(ds, "T_cloud_base", Float64, ("case",))[:] = T0
         defVar(ds, "P_cloud_base", Float64, ("case",))[:] = P0
         defVar(ds, "w", Float64, ("case",))[:] = w0
+        defVar(ds, "cloud_base_rhod", Float64, ("case",))[:] = rhod0
 
         defVar(ds, "mode_N", Float64, ("case", "mode"))[:, :] = mode_N
+        defVar(ds, "mode_N_cloud_base", Float64, ("case", "mode"))[:, :] = mode_N_cb
         defVar(ds, "mode_Dm", Float64, ("case", "mode"))[:, :] = mode_Dm
         defVar(ds, "mode_lnsig", Float64, ("case", "mode"))[:, :] = mode_lnsig
         defVar(ds, "mode_kappa", Float64, ("case", "mode"))[:, :] = mode_kappa
@@ -290,6 +319,7 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
 
         defVar(ds, "S", Float64, ("case", "height"))[:, :] = S
         defVar(ds, "Nd", Float64, ("case", "height"))[:, :] = Nd
+        defVar(ds, "Nd_kg", Float64, ("case", "height"))[:, :] = Nd_kg
         defVar(ds, "beta_ext", Float64, ("case", "height"))[:, :] = beta
         defVar(ds, "ql", Float64, ("case", "height"))[:, :] = ql
         defVar(ds, "deff", Float64, ("case", "height"))[:, :] = deff
@@ -299,7 +329,12 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         ds["T_cloud_base"].attrib["units"] = "K"
         ds["P_cloud_base"].attrib["units"] = "Pa"
         ds["w"].attrib["units"] = "m s-1"
-        ds["mode_N"].attrib["units"] = "m-3"
+        ds["cloud_base_rhod"].attrib["units"] = "kg m-3"
+        ds["cloud_base_rhod"].attrib["long_name"] = "dry-air density at cloud base"
+        ds["mode_N"].attrib["units"] = "kg-1"
+        ds["mode_N"].attrib["long_name"] = "aerosol number mixing ratio per kg dry air (BMM n_aer1 input)"
+        ds["mode_N_cloud_base"].attrib["units"] = "m-3"
+        ds["mode_N_cloud_base"].attrib["long_name"] = "aerosol number concentration at cloud base"
         ds["mode_Dm"].attrib["units"] = "m"
         ds["mode_lnsig"].attrib["units"] = "1"
         ds["mode_kappa"].attrib["units"] = "1"
@@ -307,6 +342,8 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         ds["mode_density"].attrib["units"] = "kg m-3"
         ds["S"].attrib["units"] = "1"
         ds["Nd"].attrib["units"] = "m-3"
+        ds["Nd_kg"].attrib["units"] = "kg-1"
+        ds["Nd_kg"].attrib["long_name"] = "cloud-drop number mixing ratio per kg dry air"
         ds["beta_ext"].attrib["units"] = "m-1"
         ds["ql"].attrib["units"] = "kg kg-1"
         ds["deff"].attrib["units"] = "m"

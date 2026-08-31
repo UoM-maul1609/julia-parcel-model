@@ -10,7 +10,19 @@ module SurrogateData
 using NCDatasets
 using Random
 
-export MLCase, read_cases, split_cases, write_split_csv, effective_kappa
+export MLCase, read_cases, split_cases, write_split_csv, effective_kappa, dry_air_density
+
+# Same saturated/dry-air density convention used by the Julia BMM wrapper.
+_svp_liq(T) = 100.0 * 6.1121 * exp((18.678 - (T - 273.15) / 234.5) *
+                                    (T - 273.15) / (257.14 + (T - 273.15)))
+function dry_air_density(p::Real, T::Real, rh::Real=1.0)
+    Ra = 8.314 / 29e-3
+    Rv = 8.314 / 18e-3
+    eps = Ra / Rv
+    es = _svp_liq(T)
+    qv = eps * rh * es / (p - es)
+    p / ((Ra + qv * Rv) * T)
+end
 
 struct MLCase
     id::Int
@@ -26,7 +38,8 @@ struct MLCase
     P0::Float32
     w::Float32
     S::Vector{Float32}
-    Nd::Vector{Float32}
+    Nd::Vector{Float32}        # m^-3
+    Nd_kg::Vector{Float32}     # kg^-1 dry air
     beta_ext::Vector{Float32}
     ql::Vector{Float32}
     deff::Vector{Float32}
@@ -60,6 +73,7 @@ function read_cases(path::AbstractString)
         mode_density = Array(ds["mode_density"])
         S = Array(ds["S"])
         Nd = Array(ds["Nd"])
+        Nd_kg = haskey(ds, "Nd_kg") ? Array(ds["Nd_kg"]) : nothing
         beta = Array(ds["beta_ext"])
         ql = Array(ds["ql"])
         deff = Array(ds["deff"])
@@ -88,6 +102,7 @@ function read_cases(path::AbstractString)
                 Float32(T0[i]), Float32(P0[i]), Float32(w0[i]),
                 Float32.(vec(S[i,:])),
                 Float32.(vec(Nd[i,:])),
+                Nd_kg === nothing ? Float32.(vec(Nd[i,:])) ./ Float32(dry_air_density(P0[i], T0[i], 1.0)) : Float32.(vec(Nd_kg[i,:])),
                 Float32.(vec(beta[i,:])),
                 Float32.(vec(ql[i,:])),
                 Float32.(vec(deff[i,:])),
