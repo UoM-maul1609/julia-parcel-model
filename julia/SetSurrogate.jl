@@ -268,11 +268,17 @@ function _truth_matrix(c::MLCase)
 end
 
 function _trajectory_loss(pred, truth)
-    point = mean(abs2, pred .- truth)
-    peak = mean((maximum(view(pred, j, :)) - maximum(view(truth, j, :)))^2
-                for j in axes(pred, 1))
-    final = mean(abs2, view(pred, :, size(pred, 2)) .- view(truth, :, size(truth, 2)))
-    point + 0.15f0 * peak + 0.05f0 * final
+    err = pred .- truth
+    ql_loss   = mean(abs2, view(err, 1, :))
+    fact_loss = mean(abs2, view(err, 2, :))
+    beta_loss = mean(abs2, view(err, 3, :))
+    point = ql_loss + 2.0f0 * fact_loss + beta_loss
+    peak_ql = (maximum(view(pred,1,:)) - maximum(view(truth,1,:)))^2
+    peak_fact = (maximum(view(pred,2,:)) - maximum(view(truth,2,:)))^2
+    peak_beta = (maximum(view(pred,3,:)) - maximum(view(truth,3,:)))^2
+    peak = (peak_ql + 2.0f0*peak_fact + peak_beta) / 4f0
+    final = mean(abs2,view(pred,:,size(pred,2)) .- view(truth,:,size(truth,2)))
+    point + 0.15f0*peak + 0.05f0*final
 end
 
 profile_loss(m::ProfileSurrogate, p, c::MLCase) =
