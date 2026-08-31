@@ -426,8 +426,12 @@ Unused mode slots are NaN. This fixed NetCDF storage shape is only a disk
 format; a downstream Deep Sets / attention encoder can consume the valid modes
 as a variable-length set.
 
-### BMM targets
+### BMM targets and trajectory diagnostics
 
+- parcel pressure `P(case,height)` in Pa
+- parcel temperature `T(case,height)` in K
+- relative humidity `rh(case,height)`
+- dry-air density `rhod(case,height)` in kg m^-3
 - supersaturation `S(case,height)`
 - cloud-drop number `Nd(case,height)` in m^-3
 - native cloud-drop number mixing ratio `Nd_kg(case,height)` in # kg^-1 dry air
@@ -589,151 +593,159 @@ configuration for this stage and work entirely in `julia/`.
 
 ### 1. Diagnose the synthetic ensemble
 
-From the repository root:
+From `julia/`:
 
 ```bash
-make analyse-dataset
-```
-
-or directly:
-
-```bash
-cd julia
 julia --project=. analyse_dataset.jl synthetic_bmm.nc
 ```
 
 The analysis reports distributions of cloud-base conditions, total aerosol
 number, maximum supersaturation, maximum/final cloud-drop number, activated
 fraction, extinction, liquid water and effective diameter. Activated fraction is
-computed exactly from the native mixing-ratio quantities,
+computed exactly from native number mixing ratios,
 `max(Nd_kg) / sum(mode_N)`, so it is independent of air-density changes with
-height. It also writes
-`synthetic_bmm_case_summary.csv` for plotting or further inspection.
+height. The cloud-base values of `S` and activated fraction are also checked
+because surrogate v2 imposes their known cloud-base boundary conditions.
 
-The activated-fraction histogram is especially useful before increasing the
-ensemble size: the pilot should contain substantial numbers of partially
-activated cases, rather than almost all cases lying at either zero or complete
-activation.
+### 2. Variable-number-of-modes representation (v2)
 
-### 2. Variable-number-of-modes representation
-
-The ML models do **not** receive a padded fixed four-mode vector. Each real
-mode is processed by the same encoder using its intensive properties
+The model still uses a permutation-invariant number-weighted set encoder. Each
+real mode is encoded from intensive properties and an activation-relevant derived
+feature:
 
 ```text
-log(Dm), ln(sigma), kappa_eff
+log(Dm), ln(sigma), transformed kappa_eff, approximate median Scrit
 ```
 
-where `kappa_eff` is the supplied kappa for kappa-Koehler data; the loader can
-also derive the ideal classical-Koehler equivalent from `nu`, molecular weight
-and dry density if kappa is absent.
+The `Scrit` feature is the standard kappa-Koehler critical supersaturation at the
+mode median dry diameter, evaluated at cloud-base temperature. It is only a
+physics-informed input feature: BMM remains the training truth and the network is
+not replaced by an activation parameterisation.
 
-For mode `i`, the shared encoder produces `phi_i`. These are pooled with number
-fraction weights:
+For mode `i`, the shared encoder produces `phi_i` and
 
 ```text
-Ntot = sum_i N_i
+Ntot  = sum_i N_i
 E_aer = sum_i (N_i/Ntot) phi_i
 ```
 
-and `log(Ntot)` is supplied separately. The representation is therefore:
+The pooled embedding is augmented by `log(Ntot)`, cloud-base `T`/`P`, and two
+permutation/splitting-invariant lognormal bulk moments proportional to dry
+surface area and dry volume. This preserves:
 
-- invariant to the ordering of aerosol modes;
-- able to accept a different number of modes without changing network size;
-- exactly invariant to splitting one mode into two identical modes whose
-  concentrations sum to the original concentration.
+- invariance to aerosol-mode ordering;
+- support for 1, 2, 3, ... modes without changing network size;
+- exact invariance to splitting one mode into identical submodes whose numbers
+  sum to the original mode.
 
-This is important when climate-model modal decompositions differ for numerical
-rather than physical reasons.
+### 3. Physically constrained targets
 
-### 3. Train/test split
-
-`train_surrogate.jl` splits by **complete BMM trajectory**, never by height
-point. The default split is approximately 70% training, 15% validation and 15%
-test, stratified by aerosol mode count. `training_split.csv` records the
-original BMM case number assigned to each split.
-
-This prevents profile points from one BMM simulation leaking between training
-and test datasets.
-
-### 4. Direct profile control model
-
-Train this first because it is inexpensive and tests the set encoder and data
-pipeline without an ODE solve inside every optimization step:
-
-```bash
-make train-profile
-```
-
-or:
-
-```bash
-cd julia
-julia --project=. train_surrogate.jl synthetic_bmm.nc profile 100 20260831
-```
-
-It predicts transformed profiles of
+The first pilot showed that learning absolute `Nd` allowed unphysical predictions
+above the available aerosol number and gave too little weight to very weak
+activation. Surrogate v2 therefore learns
 
 ```text
-S(z), Nd(z), beta_ext(z)
+S(z),  f_act(z) = Nd_kg(z) / sum(mode_N),  beta_ext(z)
 ```
 
-from the aerosol set, cloud-base `T`, `P`, constant `w`, and height above cloud
-base. The resulting model is saved as `profile_surrogate.bson`.
+where `f_act` is represented in a finite scaled-logit latent variable and is
+converted back with an explicit `[0,1]` bound. Therefore the model cannot create
+more cloud droplets than aerosol particles. `Nd_kg` is reconstructed as
+`f_act * Ntot`; conversion to m^-3 uses dry-air density only as a unit conversion.
+New datasets store the complete `rhod(z)` profile; older v1 datasets remain
+readable and use cloud-base density as a fallback for this display conversion.
 
-### 5. Neural ODE
+Known cloud-base conditions are imposed rather than learned:
 
-Then train the main continuous-height model:
-
-```bash
-make train-neuralode
+```text
+S(0)     = 0
+f_act(0) = 0
 ```
 
-or, for an initial short debug run:
+Extinction is *not* forced to zero at cloud base because hydrated but
+unactivated aerosol can already contribute extinction.
+
+The profile loss remains primarily pointwise, with weak peak and final-state
+terms added after the pilot showed that a pure pointwise MSE smoothed the narrow
+supersaturation maximum and activation transition.
+
+### 4. Train/test split
+
+`train_surrogate.jl` splits by complete BMM trajectory, never by height point.
+The default is approximately 70% training, 15% validation and 15% test,
+stratified by aerosol mode count. `training_split.csv` records the original BMM
+case number assigned to each split. Model initialization is also seeded for
+reproducibility.
+
+### 5. Direct profile control model
+
+Train this first:
 
 ```bash
 cd julia
+julia --project=. train_surrogate.jl synthetic_bmm.nc profile 150 20260831
+```
+
+The v2 profile network uses a slightly larger shared encoder/head and three
+continuous height coordinates (`h`, `sqrt(h)`, and a compressed near-base
+coordinate) so it can resolve the sharp activation layer more efficiently.
+Training includes gradient clipping, best-validation checkpoint restoration and
+early-flat-validation early stopping. The saved file is
+`profile_surrogate.bson`.
+
+**Models trained by the earlier absolute-`Nd` architecture are format v1 and are
+not loadable by the v2 code. Retrain after updating the code.**
+
+### 6. Neural ODE
+
+After the v2 profile model is satisfactory, run a short Neural ODE smoke test:
+
+```bash
 julia --project=. train_surrogate.jl synthetic_bmm.nc neuralode 5 20260831
 ```
 
-The Neural ODE integrates in normalized **height above cloud base**, not time.
-Its initial state is predicted from the aerosol/environment context; it does
-not use the BMM target at `z=0`, so there is no truth leakage at inference.
-The default first run is 30 epochs and saves `neuralode_surrogate.bson`.
+The Neural ODE integrates in normalized height above cloud base. Its initial
+supersaturation and activated-fraction states are fixed to the physical cloud-
+base values; only the initial extinction latent is learned. The aerosol context
+is carried as a zero-derivative augmented state so gradients still reach the
+set encoder. If the smoke test is stable, use 40 epochs as the current default.
 
-For the present dataset `w` is constant. It is kept as a separate forcing
-feature so a later dataset can replace it by `w(z)` without redesigning the
-aerosol set encoder.
+### 7. Compare held-out BMM and surrogate fields
 
-### 6. Compare models on exactly the same held-out cases
-
-After both models exist:
+After training one or both v2 models:
 
 ```bash
-make compare-surrogates
+julia --project=. compare_surrogates.jl synthetic_bmm.nc 20260831 profile 8
+julia --project=. compare_surrogates.jl synthetic_bmm.nc 20260831 both 8
 ```
 
-The reported metrics include supersaturation RMSE in percentage points and
-log-space RMSEs for cloud-drop number and extinction. The direct profile model
-is a control: keep the Neural ODE only if its continuous-state structure gives
-useful validation/test performance or extrapolation benefits.
+The comparison script caches held-out predictions and writes
+`surrogate_comparison/` containing:
+
+- BMM versus surrogate vertical profiles of `S`, activated fraction, `Nd` and
+  extinction, with BMM `ql` and `deff` for context;
+- `comparison_metrics.csv`;
+- `selected_cases.txt`, including each plotted mode's `N`, `Dm`, `lnsig`, kappa
+  and median critical supersaturation;
+- all-test 1:1 scatter plots for maximum supersaturation, maximum activation and
+  maximum extinction;
+- terminal metrics broken down by aerosol mode count and BMM activation regime.
+
+The most useful v2 metrics are activated-fraction RMSE/MAE, native-`Nd_kg`
+log-space RMSE, supersaturation RMSE and peak error, extinction log-space RMSE,
+and the number of activation-bound violations (which should be exactly zero).
 
 ### Recommended progression
 
-For the first successful 256-case dataset:
+1. Retrain the v2 profile model on the existing 256-case pilot and compare the
+   same held-out profiles that exposed the v1 weaknesses.
+2. Only if those changes behave as intended, run the 5-epoch v2 Neural ODE
+   smoke test.
+3. Generate roughly 2,000 BMM trajectories and retrain both models on exactly
+   the same split.
+4. Use the mode-count/activation-regime diagnostics and all-test peak scatters to
+   target additional BMM samples rather than increasing the ensemble blindly.
 
-```bash
-make analyse-dataset
-make train-profile
-cd julia
-julia --project=. train_surrogate.jl synthetic_bmm.nc neuralode 5 20260831
-```
-
-Use the 5-epoch Neural ODE run only to verify differentiation and solver
-stability. If it works, increase to 30 epochs. Once the complete pipeline is
-sound, generate roughly 2,000 BMM cases, retrain, and use held-out error to
-decide where additional BMM sampling is most valuable.
-
-`ql`, `deff`, and mode-resolved `Dcrit` remain in the NetCDF dataset but are not
-primary v1 training targets. They are retained for diagnostics and for the
-later existing-cloud-water / accelerated-updraft extension.
+`ql`, `deff`, mode-resolved `Dcrit`, and the new `P/T/rh/rhod` trajectory fields
+remain diagnostic rather than primary v2 learning targets. They are retained for
+the later existing-cloud-water, variable-updraft and host-model extensions.

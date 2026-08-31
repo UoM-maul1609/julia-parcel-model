@@ -246,6 +246,10 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
     mode_density = fill(NaN, ncase, maxm)
     mode_class = fill(Int16(0), ncase, maxm)
 
+    P = fill(NaN, ncase, nh)
+    T = fill(NaN, ncase, nh)
+    rh = fill(NaN, ncase, nh)
+    rhod = fill(NaN, ncase, nh)
     S = fill(NaN, ncase, nh)
     Nd = fill(NaN, ncase, nh)
     Nd_kg = fill(NaN, ncase, nh)
@@ -276,6 +280,10 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
             continue
         end
         success[i] = 1
+        P[i, :] .= _nearest_profile(q, hgrid, :p)
+        T[i, :] .= _nearest_profile(q, hgrid, :T)
+        rh[i, :] .= _nearest_profile(q, hgrid, :rh)
+        rhod[i, :] .= _nearest_profile(q, hgrid, :rhod)
         S[i, :] .= _nearest_profile(q, hgrid, :S)
         Nd[i, :] .= _nearest_profile(q, hgrid, :ndrop)
         Nd_kg[i, :] .= _nearest_profile(q, hgrid, :ndrop_kg)
@@ -296,6 +304,7 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         ds.attrib["height_top_m"] = cfg.height_top
         ds.attrib["dz_output_m"] = cfg.dz_output
         ds.attrib["kappa_flag"] = cfg.kappa_flag
+        ds.attrib["dataset_format_version"] = 2
         ds.attrib["mode_class_note"] = "class is sampling metadata only; do not use as a surrogate input"
         ds.attrib["mode_class_names"] = join(CLASS_NAMES, ",")
 
@@ -317,6 +326,10 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         defVar(ds, "mode_density", Float64, ("case", "mode"))[:, :] = mode_density
         defVar(ds, "mode_class", Int16, ("case", "mode"))[:, :] = mode_class
 
+        defVar(ds, "P", Float64, ("case", "height"))[:, :] = P
+        defVar(ds, "T", Float64, ("case", "height"))[:, :] = T
+        defVar(ds, "rh", Float64, ("case", "height"))[:, :] = rh
+        defVar(ds, "rhod", Float64, ("case", "height"))[:, :] = rhod
         defVar(ds, "S", Float64, ("case", "height"))[:, :] = S
         defVar(ds, "Nd", Float64, ("case", "height"))[:, :] = Nd
         defVar(ds, "Nd_kg", Float64, ("case", "height"))[:, :] = Nd_kg
@@ -340,6 +353,14 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
         ds["mode_kappa"].attrib["units"] = "1"
         ds["mode_molw"].attrib["units"] = "kg mol-1"
         ds["mode_density"].attrib["units"] = "kg m-3"
+        ds["P"].attrib["units"] = "Pa"
+        ds["P"].attrib["long_name"] = "parcel pressure"
+        ds["T"].attrib["units"] = "K"
+        ds["T"].attrib["long_name"] = "parcel temperature"
+        ds["rh"].attrib["units"] = "1"
+        ds["rh"].attrib["long_name"] = "relative humidity with respect to liquid water"
+        ds["rhod"].attrib["units"] = "kg m-3"
+        ds["rhod"].attrib["long_name"] = "dry-air density used for number-mixing-ratio conversion"
         ds["S"].attrib["units"] = "1"
         ds["Nd"].attrib["units"] = "m-3"
         ds["Nd_kg"].attrib["units"] = "kg-1"

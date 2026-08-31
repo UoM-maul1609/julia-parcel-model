@@ -37,6 +37,7 @@ struct MLCase
     T0::Float32
     P0::Float32
     w::Float32
+    rhod::Vector{Float32}      # kg m^-3; diagnostic/unit conversion, not an ML input
     S::Vector{Float32}
     Nd::Vector{Float32}        # m^-3
     Nd_kg::Vector{Float32}     # kg^-1 dry air
@@ -74,6 +75,7 @@ function read_cases(path::AbstractString)
         S = Array(ds["S"])
         Nd = Array(ds["Nd"])
         Nd_kg = haskey(ds, "Nd_kg") ? Array(ds["Nd_kg"]) : nothing
+        rhod_profile = haskey(ds, "rhod") ? Array(ds["rhod"]) : nothing
         beta = Array(ds["beta_ext"])
         ql = Array(ds["ql"])
         deff = Array(ds["deff"])
@@ -100,9 +102,12 @@ function read_cases(path::AbstractString)
                 Float32.(vec(mode_molw[i,1:nm])),
                 Float32.(vec(mode_density[i,1:nm])),
                 Float32(T0[i]), Float32(P0[i]), Float32(w0[i]),
+                rhod_profile === nothing ? fill(Float32(dry_air_density(P0[i], T0[i], 1.0)), length(height)) : Float32.(vec(rhod_profile[i,:])),
                 Float32.(vec(S[i,:])),
                 Float32.(vec(Nd[i,:])),
-                Nd_kg === nothing ? Float32.(vec(Nd[i,:])) ./ Float32(dry_air_density(P0[i], T0[i], 1.0)) : Float32.(vec(Nd_kg[i,:])),
+                Nd_kg === nothing ?
+                    Float32.(vec(Nd[i,:])) ./ (rhod_profile === nothing ? Float32(dry_air_density(P0[i], T0[i], 1.0)) : Float32.(vec(rhod_profile[i,:]))) :
+                    Float32.(vec(Nd_kg[i,:])),
                 Float32.(vec(beta[i,:])),
                 Float32.(vec(ql[i,:])),
                 Float32.(vec(deff[i,:])),

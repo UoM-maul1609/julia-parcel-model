@@ -14,6 +14,8 @@ q = resample_profile(r; dz=5.0, height_top=100.0)
 @assert length(q.height) > 2
 @assert all(diff(q.height) .> 0)
 @assert all(isfinite, q.ndrop)
+@assert all(isfinite, q.ndrop_kg)
+@assert all(isfinite, q.rhod)
 @assert all(isfinite, q.beta_ext)
 @assert size(q.dcrit, 2) == 2
 

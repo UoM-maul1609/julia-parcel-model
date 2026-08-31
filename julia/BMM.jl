@@ -18,7 +18,7 @@ const MOLW_WATER = 18.01528e-3
 const RHO_WATER = 1000.0
 
 Base.@kwdef struct AerosolMode
-    N::Float64 = 400.0e6       # m^-3
+    N::Float64 = 400.0e6       # # kg^-1 dry air (BMM n_aer1)
     Dm::Float64 = 80.0e-9      # dry number-median diameter, m
     lnsig::Float64 = 0.40      # ln(geometric standard deviation)
 
@@ -267,6 +267,7 @@ function _read_output(ncpath::AbstractString, c::BMMCase)
      T=vals.T,
      S=vals.rh .- 1.0,
      rh=vals.rh,
+     rhod=rhod,
      w=vals.w,
      ndrop=vals.ndrop_kg .* rhod,
      ndrop_kg=vals.ndrop_kg,
@@ -289,9 +290,10 @@ function case_diagnostics(c::BMMCase; case_index=nothing)
     println(io, "  outer dt = ", c.dt, " s")
     println(io, "  n_modes = ", length(c.modes), "; n_bins = ", c.n_bins)
     println(io, "  kappa_flag = ", c.kappa_flag)
+    rhod_cb = dry_air_density(c.pinit, c.tinit, c.rhinit)
     for (j, m) in enumerate(c.modes)
         println(io, "  mode ", j, ":")
-        println(io, "    N       = ", m.N, " m^-3  (", m.N / 1e6, " cm^-3)")
+        println(io, "    N       = ", m.N, " kg^-1 dry air  (", m.N * rhod_cb / 1e6, " cm^-3 at cloud base)")
         println(io, "    Dm      = ", m.Dm, " m  (", m.Dm * 1e9, " nm)")
         println(io, "    lnsig   = ", m.lnsig)
         println(io, "    kappa   = ", m.kappa)
@@ -401,6 +403,10 @@ function resample_profile(r; dz::Float64=5.0, height_top::Float64=r.height[end])
 
     (height=h,
      w=interp(r.w),
+     p=interp(r.p),
+     T=interp(r.T),
+     rh=interp(r.rh),
+     rhod=interp(r.rhod),
      S=interp(r.S),
      ndrop=interp(r.ndrop),
      ndrop_kg=interp(r.ndrop_kg),

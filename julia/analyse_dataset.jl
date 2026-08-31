@@ -24,7 +24,21 @@ ndfinal = [c.Nd[end] for c in cases]
 ndkgmax = [maximum(c.Nd_kg) for c in cases]
 # Exact activation fraction: both quantities are native number mixing ratios
 # per kg dry air, so changes in air density with height cancel out.
-fact = [ndkgmax[i]/max(ntot_kg[i],1.0) for i in eachindex(cases)]
+fact_profiles = [[c.Nd_kg[j]/max(ntot_kg[i],1.0) for j in eachindex(c.height)] for (i,c) in enumerate(cases)]
+fact = [maximum(f) for f in fact_profiles]
+fact0 = [f[1] for f in fact_profiles]
+s0 = [c.S[1] for c in cases]
+z_smax = [c.height[argmax(c.S)] for c in cases]
+z_fact90 = Float64[]
+for (i,c) in enumerate(cases)
+    f = fact_profiles[i]
+    if fact[i] <= 1e-12
+        push!(z_fact90, NaN)
+    else
+        j = findfirst(x -> x >= 0.9*fact[i], f)
+        push!(z_fact90, j === nothing ? NaN : c.height[j])
+    end
+end
 bmax = [maximum(c.beta_ext) for c in cases]
 qlmax = [maximum(c.ql) for c in cases]
 de50 = [maximum(filter(isfinite,c.deff); init=0f0) for c in cases]
@@ -43,10 +57,18 @@ qline("Smax",smax;scale=100,unit="%")
 qline("Nd max",ndmax;scale=1e-6,unit="cm^-3")
 qline("Nd final",ndfinal;scale=1e-6,unit="cm^-3")
 qline("activated fraction",fact;unit="")
+qline("cloud-base |S|",abs.(s0);scale=100,unit="%")
+qline("cloud-base activation",fact0;unit="")
+qline("height of Smax",z_smax;unit="m")
+finite_z90 = filter(isfinite,z_fact90)
+isempty(finite_z90) || qline("height of 90% act.",finite_z90;unit="m")
 qline("max extinction",bmax;unit="m^-1")
 qline("max ql",qlmax;unit="kg kg^-1")
 qline("max deff",de50;scale=1e6,unit="um")
 
+println("\nCloud-base boundary checks used by surrogate v2:")
+@printf("  max |S(0)| = %.6g %%\n",100*maximum(abs.(s0)))
+@printf("  max f_act(0) = %.6g\n",maximum(fact0))
 println("\nActivation-regime counts (using max Nd_kg / total aerosol number mixing ratio):")
 for (label,lo,hi) in (("<1%",-Inf,0.01),("1-10%",0.01,0.10),("10-50%",0.10,0.50),
                       ("50-90%",0.50,0.90),("90-110%",0.90,1.10),(">110%",1.10,Inf))
