@@ -192,7 +192,7 @@ function summarise_cases(cases::Vector{BMMCase})
     # at cloud base for human-readable diagnostics.
     Ns = Float64[]
     for c in cases
-        rhod_cb = BMM.dry_air_density(c.pinit, c.tinit, c.rhinit)
+        rhod_cb = BMM.dry_air_density(c.pinit, c.tinit, 1.0)
         append!(Ns, [m.N * rhod_cb / 1e6 for m in c.modes])
     end
     Ds = getfield.(allmodes, :Dm) .* 1e9
@@ -234,7 +234,7 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
     T0 = [c.tinit for c in cases]
     P0 = [c.pinit for c in cases]
     w0 = [c.winit for c in cases]
-    rhod0 = [BMM.dry_air_density(c.pinit, c.tinit, c.rhinit) for c in cases]
+    rhod0 = [BMM.dry_air_density(c.pinit, c.tinit, 1.0) for c in cases]
 
     mode_N = fill(NaN, ncase, maxm)            # # kg^-1 dry air (BMM input)
     mode_N_cb = fill(NaN, ncase, maxm)         # m^-3 at cloud base, diagnostic

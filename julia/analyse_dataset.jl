@@ -66,7 +66,7 @@ qline("max extinction",bmax;unit="m^-1")
 qline("max ql",qlmax;unit="kg kg^-1")
 qline("max deff",de50;scale=1e6,unit="um")
 
-println("\nCloud-base boundary checks used by surrogate v2:")
+println("\nInitial-state boundary checks used by surrogate v2:")
 @printf("  max |S(0)| = %.6g %%\n",100*maximum(abs.(s0)))
 @printf("  max f_act(0) = %.6g\n",maximum(fact0))
 println("\nActivation-regime counts (using max Nd_kg / total aerosol number mixing ratio):")

@@ -22,7 +22,7 @@ for n in sort(unique(length.(getfield.(cases, :mode_N))))
     println("  $n modes: train=$(count(c -> length(c.mode_N) == n, split.train)) val=$(count(c -> length(c.mode_N) == n, split.val)) test=$(count(c -> length(c.mode_N) == n, split.test))")
 end
 println("surrogate v2 target: S, bounded activated fraction Nd_kg/sum(mode_N), beta_ext")
-println("hard constraints: S(z=0)=0 and activated_fraction(z=0)=0; 0 <= activated_fraction <= 1")
+println("hard constraints: S(z=0)=-0.05 and activated_fraction(z=0)=0; 0 <= activated_fraction <= 1")
 
 hscale = maximum(maximum(c.height) for c in cases)
 rng = MersenneTwister(seed)

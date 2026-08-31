@@ -42,6 +42,9 @@ const DM_SCALE = 1.0f-7
 const M2_SCALE = 1.0f-5               # sum(N D^2), m^2 kg^-1
 const M3_SCALE = 1.0f-12              # sum(N D^3), m^3 kg^-1
 const W_FLOOR = 1.0f-3
+const S_INITIAL = -0.05f0
+const S_INITIAL_LATENT = asinh(S_INITIAL / S_SCALE)
+
 
 # Activated-fraction transform. The small epsilon keeps exact 0/1 targets
 # finite in latent space; the inverse is explicitly clamped to [0,1].
@@ -241,7 +244,7 @@ function _profile_point(core, ctx, c::MLCase, h::Real, hscale::Real)
     if abs(hhat) <= 1f-7
         # Exact cloud-base constraints. Extinction remains learned because
         # unactivated hydrated aerosol can already have finite extinction.
-        return Float32[0f0, FACT_ZERO_LATENT, raw[3]]
+        return Float32[S_INITIAL_LATENT, FACT_ZERO_LATENT, raw[3]]
     end
     raw
 end
@@ -282,7 +285,7 @@ function _solve_neuralode(m::NeuralODESurrogate, p, c::MLCase;
     ctx0 = aerosol_context(core0.encoder, c)
     w0 = forcing_w(c, 0f0)
     beta0 = core0.init_net(vcat(ctx0, w0))[1]
-    y0 = Float32[0f0, FACT_ZERO_LATENT, beta0]
+    y0 = Float32[S_INITIAL_LATENT, FACT_ZERO_LATENT, beta0]
     u0 = vcat(y0, ctx0)
     nctx = length(ctx0)
 

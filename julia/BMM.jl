@@ -44,7 +44,7 @@ Base.@kwdef struct BMMCase
     winit::Float64 = 0.6
     tinit::Float64 = 282.0
     pinit::Float64 = 90000.0
-    rhinit::Float64 = 1.0
+    rhinit::Float64 = 0.95
     radinit::Float64 = 500.0
 
     microphysics_flag::Int = 1
@@ -101,13 +101,12 @@ end
 """
     cloud_base_case(; winit, height_top=500, max_dt=5, max_dz=2, kwargs...)
 
-Construct a saturated, constant-updraft BMM case that covers a fixed distance
-above cloud base. `runtime = height_top / winit`. `max_dz` limits the vertical
+Construct a constant-updraft BMM parcel case spanning a fixed ascent distance. `runtime = height_top / winit`. `max_dz` limits the vertical
 distance travelled in one BMM step at strong updrafts.
 """
 function cloud_base_case(; winit::Float64=0.6, height_top::Float64=500.0,
                           max_dt::Float64=5.0, max_dz::Float64=2.0,
-                          zinit::Float64=0.0, rhinit::Float64=1.0, kwargs...)
+                          zinit::Float64=0.0, rhinit::Float64=0.95, kwargs...)
     winit > 0 || throw(ArgumentError("winit must be positive"))
     height_top > 0 || throw(ArgumentError("height_top must be positive"))
     dt = min(max_dt, max_dz / winit)
@@ -290,7 +289,7 @@ function case_diagnostics(c::BMMCase; case_index=nothing)
     println(io, "  outer dt = ", c.dt, " s")
     println(io, "  n_modes = ", length(c.modes), "; n_bins = ", c.n_bins)
     println(io, "  kappa_flag = ", c.kappa_flag)
-    rhod_cb = dry_air_density(c.pinit, c.tinit, c.rhinit)
+    rhod_cb = dry_air_density(c.pinit, c.tinit, 1.0)
     for (j, m) in enumerate(c.modes)
         println(io, "  mode ", j, ":")
         println(io, "    N       = ", m.N, " kg^-1 dry air  (", m.N * rhod_cb / 1e6, " cm^-3 at cloud base)")

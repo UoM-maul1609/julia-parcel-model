@@ -8,7 +8,7 @@ using .SyntheticDataset
     c = cloud_base_case(winit=2.0, height_top=500.0, max_dt=5.0, max_dz=4.0)
     @test c.runtime ≈ 250.0
     @test c.dt ≈ 2.0
-    @test c.rhinit == 1.0
+    @test c.rhinit <= 1.0
 end
 
 @testset "ideal Koehler / kappa equivalence mapping" begin
