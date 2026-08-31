@@ -12,7 +12,7 @@ using NCDatasets
 
 export AerosolMode, BMMCase, cloud_base_case, effective_kappa,
        default_bmm_exe, run_bmm, run_bmm_batch, derive_dcrit,
-       resample_profile, to_namelist
+       resample_profile, to_namelist, case_diagnostics
 
 const MOLW_WATER = 18.01528e-3
 const RHO_WATER = 1000.0
@@ -48,7 +48,6 @@ Base.@kwdef struct BMMCase
     radinit::Float64 = 500.0
 
     microphysics_flag::Int = 1
-    ice_flag::Int = 0
     vent_flag::Int = 1
     kappa_flag::Int = 1       # 1 = kappa-Koehler, 0 = classical ideal-solution Koehler
     updraft_type::Int = 1
@@ -144,7 +143,9 @@ function to_namelist(c::BMMCase, outputfile::AbstractString)
     println(io, "    radinit=", c.radinit, ",")
     println(io, "    bubble_flag=.false.,")
     println(io, "    microphysics_flag=", c.microphysics_flag, ",")
-    println(io, "    ice_flag=", c.ice_flag, ",")
+    # Liquid-only truth generation. Keep ice physics out of this surrogate
+    # dataset even when cloud-base temperature is below 273.15 K.
+    println(io, "    ice_flag=0,")
     # Fixed numerical configuration for all truth-generation cases.
     # These are intentionally not BMMCase inputs: a training dataset must not
     # silently mix different bin/advection or collision-coalescence schemes.
@@ -276,6 +277,47 @@ function _read_output(ncpath::AbstractString, c::BMMCase)
      case=c)
 end
 
+"""Return a compact, human-readable description of one BMM input case."""
+function case_diagnostics(c::BMMCase; case_index=nothing)
+    io = IOBuffer()
+    case_index === nothing || println(io, "case: ", case_index)
+    println(io, "  liquid-only: ice_flag=0; bin_scheme_flag=0; sce_flag=0")
+    println(io, "  T_cloud_base = ", c.tinit, " K")
+    println(io, "  P_cloud_base = ", c.pinit, " Pa (", c.pinit / 100.0, " hPa)")
+    println(io, "  w = ", c.winit, " m s^-1")
+    println(io, "  runtime = ", c.runtime, " s")
+    println(io, "  outer dt = ", c.dt, " s")
+    println(io, "  n_modes = ", length(c.modes), "; n_bins = ", c.n_bins)
+    println(io, "  kappa_flag = ", c.kappa_flag)
+    for (j, m) in enumerate(c.modes)
+        println(io, "  mode ", j, ":")
+        println(io, "    N       = ", m.N, " m^-3  (", m.N / 1e6, " cm^-3)")
+        println(io, "    Dm      = ", m.Dm, " m  (", m.Dm * 1e9, " nm)")
+        println(io, "    lnsig   = ", m.lnsig)
+        println(io, "    kappa   = ", m.kappa)
+        println(io, "    density = ", m.density, " kg m^-3")
+        println(io, "    nu      = ", m.nu)
+        println(io, "    molw    = ", m.molw, " kg mol^-1")
+        println(io, "    kappa_eff(classical) = ", effective_kappa(m))
+    end
+    String(take!(io))
+end
+
+function _copy_failure_files(src::AbstractString, dst::AbstractString, c::BMMCase,
+                             i::Integer, err)
+    mkpath(dst)
+    for name in ("namelist.in", "stdout.log", "stderr.log", "output.nc")
+        f = joinpath(src, name)
+        isfile(f) && cp(f, joinpath(dst, name); force=true)
+    end
+    open(joinpath(dst, "case_summary.txt"), "w") do io
+        write(io, case_diagnostics(c; case_index=i))
+        println(io, "\nJulia exception:")
+        showerror(io, err)
+        println(io)
+    end
+end
+
 function run_bmm(c::BMMCase; exe::AbstractString=default_bmm_exe(),
                  workdir::AbstractString=mktempdir())
     isfile(exe) || error("BMM executable not found at $exe; run `make bmm`")
@@ -297,14 +339,26 @@ function run_bmm(c::BMMCase; exe::AbstractString=default_bmm_exe(),
     _read_output(ncpath, c)
 end
 
-function run_bmm_batch(cases::Vector{BMMCase}; exe::AbstractString=default_bmm_exe(), kwargs...)
+function run_bmm_batch(cases::Vector{BMMCase}; exe::AbstractString=default_bmm_exe(),
+                       failure_dir::Union{Nothing,AbstractString}=nothing, kwargs...)
     results = Vector{Any}(undef, length(cases))
     Threads.@threads for i in eachindex(cases)
         wd = mktempdir()
         try
             results[i] = run_bmm(cases[i]; exe=exe, workdir=wd, kwargs...)
         catch err
-            @warn "BMM case $i failed" exception=(err, catch_backtrace())
+            saved = nothing
+            if failure_dir !== nothing
+                saved = joinpath(abspath(failure_dir), "case_" * lpad(string(i), 4, '0'))
+                try
+                    _copy_failure_files(wd, saved, cases[i], i, err)
+                catch save_err
+                    @warn "Could not save diagnostics for failed BMM case $i" exception=(save_err, catch_backtrace())
+                end
+            end
+            msg = "BMM case $i failed\n" * case_diagnostics(cases[i]; case_index=i)
+            saved === nothing || (msg *= "  retained failure files: $saved\n")
+            @warn msg exception=(err, catch_backtrace())
             results[i] = nothing
         finally
             rm(wd; recursive=true, force=true)

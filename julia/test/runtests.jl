@@ -57,3 +57,10 @@ end
     @test !hasfield(BMMCase, :bin_scheme_flag)
     @test !hasfield(BMMCase, :sce_flag)
 end
+
+@testset "fixed liquid-only truth configuration" begin
+    nml = to_namelist(cloud_base_case(), "test.nc")
+    @test occursin("ice_flag=0", nml)
+    @test occursin("bin_scheme_flag=0", nml)
+    @test occursin("sce_flag=0", nml)
+end

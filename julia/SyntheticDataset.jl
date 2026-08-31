@@ -322,7 +322,9 @@ function run_and_write_dataset(path::AbstractString; cfg::SamplingConfig=Samplin
     cases, classes = sample_cases(cfg)
     summarise_cases(cases)
     println("Running BMM using $(Threads.nthreads()) Julia worker threads...")
-    results = BMM.run_bmm_batch(cases; exe=exe)
+    failure_dir = get(ENV, "BMM_FAILURE_DIR", splitext(abspath(path))[1] * "_failures")
+    println("Failed-case diagnostics will be retained under: $failure_dir")
+    results = BMM.run_bmm_batch(cases; exe=exe, failure_dir=failure_dir)
     write_dataset(path, cases, classes, results; cfg=cfg)
 end
 

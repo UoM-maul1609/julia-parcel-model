@@ -499,3 +499,48 @@ BMM is intentionally run as a fresh executable process per truth case. The
 Fortran module owns process-global allocated state, so treating BMM as an
 offline truth generator is safer than differentiating through or repeatedly
 calling it in-process. The trained surrogate will be pure Julia.
+
+## Diagnosing failed BMM ensemble cases
+
+Synthetic truth generation is **liquid-only**, including for supercooled cloud
+bases. The Julia wrapper always writes:
+
+```text
+ice_flag=0
+bin_scheme_flag=0
+sce_flag=0
+```
+
+If BMM exits non-zero, the terminal warning prints the complete sampled case:
+cloud-base T/P, constant updraft, runtime/timestep, and every aerosol mode's
+N, Dm, lnsig, kappa, density, van't Hoff factor, and molecular weight.
+
+The original BMM inputs and logs are also retained. For an output named
+`synthetic_bmm.nc`, failures are stored by default as:
+
+```text
+synthetic_bmm_failures/
+  case_0131/
+    case_summary.txt
+    namelist.in
+    stdout.log
+    stderr.log
+    output.nc          # only if BMM created one before failing
+```
+
+Override the directory with `BMM_FAILURE_DIR`, for example:
+
+```bash
+BMM_FAILURE_DIR=failed_cases \
+BMM_EXE=../bmm/main.exe \
+julia --project=. -t auto generate_synthetic_dataset.jl 256 synthetic_bmm.nc 4 20260831
+```
+
+A failed case can then be reproduced directly from the repository root with:
+
+```bash
+./bmm/main.exe julia/synthetic_bmm_failures/case_0131/namelist.in
+```
+
+(adjust the path if the dataset was written elsewhere). The saved namelist is
+the exact input used in the failed ensemble run.
