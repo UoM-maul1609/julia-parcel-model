@@ -21,12 +21,13 @@ println("trajectory split: $(length(split.train)) train / $(length(split.val)) v
 for n in sort(unique(length.(getfield.(cases, :mode_N))))
     println("  $n modes: train=$(count(c -> length(c.mode_N) == n, split.train)) val=$(count(c -> length(c.mode_N) == n, split.val)) test=$(count(c -> length(c.mode_N) == n, split.test))")
 end
-println("surrogate v2 target: S, bounded activated fraction Nd_kg/sum(mode_N), beta_ext")
-println("hard constraints: S(z=0)=-0.05 and activated_fraction(z=0)=0; 0 <= activated_fraction <= 1")
+println("surrogate v3 target: ql, bounded activated fraction Nd_kg/sum(mode_N), beta_ext")
+println("physics: S diagnosed from qtot = ql + (1+S) qvs(T,P)")
+println("inputs include qtot_initial and local T(z), P(z); activated_fraction(z=0)=0 exactly")
 
 hscale = maximum(maximum(c.height) for c in cases)
 rng = MersenneTwister(seed)
-Random.seed!(seed)  # deterministic Flux parameter initialization as well as split/batching
+Random.seed!(seed)
 
 if kind == "profile"
     p, m = build_profile_model(hscale=hscale)
@@ -35,7 +36,7 @@ if kind == "profile"
     println("validation metrics: ", evaluate_profile(m, p, split.val))
     println("TEST metrics: ", evaluate_profile(m, p, split.test))
     save_profile_model("profile_surrogate.bson", p, m)
-    println("saved profile_surrogate.bson (surrogate format v2)")
+    println("saved profile_surrogate.bson (surrogate format v3)")
 elseif kind == "neuralode"
     p, m = build_neuralode_model(hscale=hscale)
     train_neuralode!(p, m, split.train; epochs=epochs, val_cases=split.val, rng=rng)
@@ -43,7 +44,7 @@ elseif kind == "neuralode"
     println("validation metrics: ", evaluate_neuralode(m, p, split.val))
     println("TEST metrics: ", evaluate_neuralode(m, p, split.test))
     save_neuralode_model("neuralode_surrogate.bson", p, m)
-    println("saved neuralode_surrogate.bson (surrogate format v2)")
+    println("saved neuralode_surrogate.bson (surrogate format v3)")
 else
     error("model kind must be 'profile' or 'neuralode'")
 end

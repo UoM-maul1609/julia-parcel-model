@@ -6,7 +6,7 @@ No padding is presented to the neural network: each case stores only its real
 modes, and the set encoder handles 1, 2, 3, ... modes with shared weights.
 
 Full parcel P(z) and T(z) profiles are retained for physical diagnostics such
-as total-water conservation. They are not currently surrogate inputs.
+as total-water conservation. Version 3 uses T(z), P(z), and initial total water as physical surrogate inputs.
 """
 module SurrogateData
 
@@ -14,7 +14,7 @@ using NCDatasets
 using Random
 
 export MLCase, read_cases, split_cases, write_split_csv, effective_kappa,
-       dry_air_density, qvs_liq, total_water, total_water_profile
+       dry_air_density, qvs_liq, total_water, total_water_profile, initial_total_water
 
 # Same saturation-vapour-pressure fit used by the Julia BMM wrapper.
 _svp_liq(T) = 100.0 * 6.1121 * exp((18.678 - (T - 273.15) / 234.5) *
@@ -51,8 +51,8 @@ struct MLCase
     T0::Float32
     P0::Float32
     w::Float32
-    P::Vector{Float32}         # Pa; full BMM parcel profile, diagnostic only
-    T::Vector{Float32}         # K; full BMM parcel profile, diagnostic only
+    P::Vector{Float32}         # Pa; full parcel profile, v3 thermodynamic input
+    T::Vector{Float32}         # K; full parcel profile, v3 thermodynamic input
     rhod::Vector{Float32}      # kg m^-3; diagnostic/unit conversion, not an ML input
     S::Vector{Float32}
     Nd::Vector{Float32}        # m^-3
@@ -76,6 +76,9 @@ end
 
 total_water_profile(c::MLCase) =
     Float64[total_water(c, i) for i in eachindex(c.height)]
+
+"""Initial total-water mixing ratio supplied as the conserved thermodynamic context."""
+initial_total_water(c::MLCase) = total_water(c, 1)
 
 function effective_kappa(nu::Real, molw::Real, density::Real; rho_water=1000.0, mw_water=18.01528e-3)
     Float32(nu * (density / rho_water) * (mw_water / molw))
