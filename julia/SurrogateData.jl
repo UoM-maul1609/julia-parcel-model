@@ -4,17 +4,31 @@ Read BMM training NetCDF files into trajectory-level objects for ML.
 The ML representation is deliberately variable-length in aerosol mode count.
 No padding is presented to the neural network: each case stores only its real
 modes, and the set encoder handles 1, 2, 3, ... modes with shared weights.
+
+Full parcel P(z) and T(z) profiles are retained for physical diagnostics such
+as total-water conservation. They are not currently surrogate inputs.
 """
 module SurrogateData
 
 using NCDatasets
 using Random
 
-export MLCase, read_cases, split_cases, write_split_csv, effective_kappa, dry_air_density
+export MLCase, read_cases, split_cases, write_split_csv, effective_kappa,
+       dry_air_density, qvs_liq, total_water, total_water_profile
 
-# Same saturated/dry-air density convention used by the Julia BMM wrapper.
+# Same saturation-vapour-pressure fit used by the Julia BMM wrapper.
 _svp_liq(T) = 100.0 * 6.1121 * exp((18.678 - (T - 273.15) / 234.5) *
                                     (T - 273.15) / (257.14 + (T - 273.15)))
+
+"""Saturation water-vapour mixing ratio using the BMM convention."""
+function qvs_liq(T::Real, P::Real)
+    Ra = 8.314 / 29e-3
+    Rv = 8.314 / 18e-3
+    eps = Ra / Rv
+    es = _svp_liq(T)
+    eps * es / (P - es)
+end
+
 function dry_air_density(p::Real, T::Real, rh::Real=1.0)
     Ra = 8.314 / 29e-3
     Rv = 8.314 / 18e-3
@@ -37,6 +51,8 @@ struct MLCase
     T0::Float32
     P0::Float32
     w::Float32
+    P::Vector{Float32}         # Pa; full BMM parcel profile, diagnostic only
+    T::Vector{Float32}         # K; full BMM parcel profile, diagnostic only
     rhod::Vector{Float32}      # kg m^-3; diagnostic/unit conversion, not an ML input
     S::Vector{Float32}
     Nd::Vector{Float32}        # m^-3
@@ -44,8 +60,22 @@ struct MLCase
     beta_ext::Vector{Float32}
     ql::Vector{Float32}
     deff::Vector{Float32}
-    Dcrit::Matrix{Float32}   # height x real aerosol mode
+    Dcrit::Matrix{Float32}     # height x real aerosol mode
 end
+
+"""
+Total water mixing ratio for one trajectory point.
+
+Uses the BMM humidity convention
+    qv = (1 + S) * eps * es(T) / (P - es(T))
+so qtot = ql + qv.
+"""
+function total_water(c::MLCase, i::Int)
+    Float64(c.ql[i]) + (1.0 + Float64(c.S[i])) * qvs_liq(c.T[i], c.P[i])
+end
+
+total_water_profile(c::MLCase) =
+    Float64[total_water(c, i) for i in eachindex(c.height)]
 
 function effective_kappa(nu::Real, molw::Real, density::Real; rho_water=1000.0, mw_water=18.01528e-3)
     Float32(nu * (density / rho_water) * (mw_water / molw))
@@ -72,6 +102,15 @@ function read_cases(path::AbstractString)
         mode_nu = Array(ds["mode_nu"])
         mode_molw = Array(ds["mode_molw"])
         mode_density = Array(ds["mode_density"])
+
+        # Dataset format v2 stores the full parcel thermodynamic trajectory.
+        # Require it here rather than silently constructing an incorrect
+        # total-water diagnostic from T0/P0.
+        haskey(ds, "P") || error("dataset $path has no P(height) profile; regenerate with dataset format v2")
+        haskey(ds, "T") || error("dataset $path has no T(height) profile; regenerate with dataset format v2")
+        P_profile = Array(ds["P"])
+        T_profile = Array(ds["T"])
+
         S = Array(ds["S"])
         Nd = Array(ds["Nd"])
         Nd_kg = haskey(ds, "Nd_kg") ? Array(ds["Nd_kg"]) : nothing
@@ -102,11 +141,17 @@ function read_cases(path::AbstractString)
                 Float32.(vec(mode_molw[i,1:nm])),
                 Float32.(vec(mode_density[i,1:nm])),
                 Float32(T0[i]), Float32(P0[i]), Float32(w0[i]),
-                rhod_profile === nothing ? fill(Float32(dry_air_density(P0[i], T0[i], 1.0)), length(height)) : Float32.(vec(rhod_profile[i,:])),
+                Float32.(vec(P_profile[i,:])),
+                Float32.(vec(T_profile[i,:])),
+                rhod_profile === nothing ?
+                    Float32[Float32(dry_air_density(P_profile[i,j], T_profile[i,j], 1.0 + S[i,j])) for j in eachindex(height)] :
+                    Float32.(vec(rhod_profile[i,:])),
                 Float32.(vec(S[i,:])),
                 Float32.(vec(Nd[i,:])),
                 Nd_kg === nothing ?
-                    Float32.(vec(Nd[i,:])) ./ (rhod_profile === nothing ? Float32(dry_air_density(P0[i], T0[i], 1.0)) : Float32.(vec(rhod_profile[i,:]))) :
+                    Float32.(vec(Nd[i,:])) ./ (rhod_profile === nothing ?
+                        Float32[Float32(dry_air_density(P_profile[i,j], T_profile[i,j], 1.0 + S[i,j])) for j in eachindex(height)] :
+                        Float32.(vec(rhod_profile[i,:]))) :
                     Float32.(vec(Nd_kg[i,:])),
                 Float32.(vec(beta[i,:])),
                 Float32.(vec(ql[i,:])),
