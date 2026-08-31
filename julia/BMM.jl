@@ -49,8 +49,6 @@ Base.@kwdef struct BMMCase
 
     microphysics_flag::Int = 1
     ice_flag::Int = 0
-    bin_scheme_flag::Int = 0
-    sce_flag::Int = 0
     vent_flag::Int = 1
     kappa_flag::Int = 1       # 1 = kappa-Koehler, 0 = classical ideal-solution Koehler
     updraft_type::Int = 1
@@ -89,10 +87,10 @@ function _validate(m::AerosolMode)
 end
 
 function _validate(c::BMMCase)
-    ! One component per external mode plus an identity mass-fraction matrix
-    ! lets each mode carry its own kappa or classical-Koehler chemistry.
-    ! This is more appropriate than putting multiple lognormals in n_intern.
-    ! Keep at least one mode because BMM requires n_mode >= 1.
+    # One component per external mode plus an identity mass-fraction matrix
+    # lets each mode carry its own kappa or classical-Koehler chemistry.
+    # This is more appropriate than putting multiple lognormals in n_intern.
+    # Keep at least one mode because BMM requires n_mode >= 1.
     isempty(c.modes) && throw(ArgumentError("BMMCase requires at least one aerosol mode"))
     c.kappa_flag in (0, 1) || throw(ArgumentError("kappa_flag must be 0 or 1"))
     c.n_bins > 0 || throw(ArgumentError("n_bins must be positive"))
@@ -147,8 +145,11 @@ function to_namelist(c::BMMCase, outputfile::AbstractString)
     println(io, "    bubble_flag=.false.,")
     println(io, "    microphysics_flag=", c.microphysics_flag, ",")
     println(io, "    ice_flag=", c.ice_flag, ",")
-    println(io, "    bin_scheme_flag=", c.bin_scheme_flag, ",")
-    println(io, "    sce_flag=", c.sce_flag, ",")
+    # Fixed numerical configuration for all truth-generation cases.
+    # These are intentionally not BMMCase inputs: a training dataset must not
+    # silently mix different bin/advection or collision-coalescence schemes.
+    println(io, "    bin_scheme_flag=0,")
+    println(io, "    sce_flag=0,")
     println(io, "    vent_flag=", c.vent_flag, ",")
     println(io, "    kappa_flag=", c.kappa_flag, ",")
     println(io, "    updraft_type=", c.updraft_type, ",")
@@ -251,9 +252,9 @@ function _read_output(ncpath::AbstractString, c::BMMCase)
     nm = n_modes(c)
     dcrit = fill(NaN, nt, nm)
     for it in 1:nt, im in 1:nm
-        dcrit[it, im] = derive_dcrit(view(vals.nliq, it, im, :),
-                                      view(vals.nwat, it, im, :),
-                                      view(vals.mbinedges, im, :),
+        dcrit[it, im] = derive_dcrit(view(vals.nliq, :, im, it),
+                                      view(vals.nwat, :, im, it),
+                                      view(vals.mbinedges, :, im),
                                       c.modes[im].density)
     end
 

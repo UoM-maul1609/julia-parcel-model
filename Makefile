@@ -12,7 +12,7 @@ clean-bmm:
 	$(MAKE) -C $(BMM_DIR) cleanall
 
 julia-instantiate:
-	cd julia && $(JULIA) --project=. -e 'using Pkg; Pkg.instantiate()'
+	cd julia && $(JULIA) --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
 
 julia-test:
 	cd julia && $(JULIA) --project=. test/runtests.jl

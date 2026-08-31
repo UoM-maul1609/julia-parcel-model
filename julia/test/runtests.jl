@@ -48,3 +48,12 @@ end
     @test all(c -> 0.1 <= c.winit <= 10.0, cases)
     @test all(c -> all(m -> 0.0 <= m.kappa <= 1.4, c.modes), cases)
 end
+
+@testset "fixed BMM numerical scheme" begin
+    c = cloud_base_case(winit=1.0, height_top=20.0)
+    nml = BMM.to_namelist(c, "dummy.nc")
+    @test occursin("bin_scheme_flag=0", nml)
+    @test occursin("sce_flag=0", nml)
+    @test !hasfield(BMMCase, :bin_scheme_flag)
+    @test !hasfield(BMMCase, :sce_flag)
+end

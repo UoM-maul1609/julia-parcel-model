@@ -12,6 +12,17 @@ The immediate workflow is:
 4. store an ML-friendly NetCDF training ensemble;
 5. train a surrogate on that ensemble.
 
+## Fixed BMM numerical configuration
+
+All reference/training runs use exactly:
+
+```text
+bin_scheme_flag = 0
+sce_flag        = 0
+```
+
+These choices are hard-coded in the Julia namelist writer and are deliberately **not** exposed as `BMMCase` fields or synthetic-sampling parameters. This prevents a training dataset from silently mixing different BMM bin or collision/coalescence schemes.
+
 ## Multimode aerosol interface
 
 A mode is represented in Julia by
