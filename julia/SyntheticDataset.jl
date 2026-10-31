@@ -38,6 +38,14 @@ Base.@kwdef struct SamplingConfig
     kappa_flag::Int = 1
     dmina::Float64 = 1.0e-9
     dmaxa::Float64 = 10.0e-6
+
+    # Synthetic-design filter, not a BMM limit. Reject sampled aerosol modes
+    # whose approximate median kappa-Koehler critical supersaturation lies
+    # above the activation domain we intend to parameterise.
+    #
+    # Dimensionless: 0.30 = 30% supersaturation.
+    scrit_max::Float64 = 0.30
+    max_mode_resamples::Int = 1000
 end
 
 const CLASS_NAMES = ("nucleation", "aitken", "accumulation", "coarse")
@@ -46,6 +54,23 @@ const CLASS_CDF = (0.12, 0.42, 0.88, 1.00)
 
 _loguniform(rng, lo, hi) = exp(log(lo) + rand(rng) * (log(hi) - log(lo)))
 _uniform(rng, lo, hi) = lo + rand(rng) * (hi - lo)
+
+# Approximate kappa-Koehler critical supersaturation at the mode median dry
+# diameter. This is used only to define the synthetic training domain; it does
+# not alter BMM physics.
+const _SIGMA_WATER = 0.072          # N m^-1
+const _MOLW_WATER = 18.01528e-3    # kg mol^-1
+const _R_GAS = 8.314                # J mol^-1 K^-1
+const _RHO_WATER = 1000.0           # kg m^-3
+
+function _critical_supersaturation(Dm::Real, kappa::Real, T::Real)
+    Dm > 0 || return Inf
+    kappa > 0 || return Inf
+    T > 0 || return Inf
+
+    A = 4.0 * _SIGMA_WATER * _MOLW_WATER / (_R_GAS * T * _RHO_WATER)
+    sqrt(4.0 * A^3 / (27.0 * kappa * Dm^3))
+end
 
 function _choose_class(rng)
     u = rand(rng)
@@ -144,16 +169,40 @@ function sample_cases(cfg::SamplingConfig)
     counts = [1 + mod(i - 1, cfg.max_modes) for i in 1:cfg.n_cases]
     shuffle!(rng, counts)
 
+    rejected_modes = 0
+    sampled_modes = 0
+
     for nm in counts
+        # Scrit has a weak temperature dependence, so draw the parcel state
+        # before screening aerosol modes.
+        T0, P0 = _sample_cloud_base(rng, cfg)
+
         specs = NamedTuple[]
         cls = Int[]
         for _ in 1:nm
-            spec, c = _sample_mode(rng)
-            push!(specs, spec)
-            push!(cls, c)
+            accepted = false
+            for attempt in 1:cfg.max_mode_resamples
+                spec, c = _sample_mode(rng)
+                sampled_modes += 1
+                scrit = _critical_supersaturation(spec.Dm, spec.kappa, T0)
+
+                if isfinite(scrit) && scrit <= cfg.scrit_max
+                    push!(specs, spec)
+                    push!(cls, c)
+                    accepted = true
+                    break
+                end
+
+                rejected_modes += 1
+            end
+
+            accepted || error(
+                "failed to sample an aerosol mode with median Scrit <= " *
+                "$(100 * cfg.scrit_max)% after $(cfg.max_mode_resamples) attempts; " *
+                "consider increasing scrit_max or revising the sampling ranges"
+            )
         end
 
-        T0, P0 = _sample_cloud_base(rng, cfg)
         rhod_cb = BMM.dry_air_density(P0, T0, 1.0)
         modes = AerosolMode[_bmm_mode(spec, rhod_cb) for spec in specs]
 
@@ -179,6 +228,14 @@ function sample_cases(cfg::SamplingConfig)
         push!(classes, cls)
     end
 
+    rejection_fraction = sampled_modes > 0 ? rejected_modes / sampled_modes : 0.0
+    println(
+        "Aerosol Scrit filter: accepted $(sum(counts)) modes; " *
+        "rejected $rejected_modes draws " *
+        "($(round(100 * rejection_fraction; digits=2))% of draws); " *
+        "median-mode Scrit <= $(100 * cfg.scrit_max)%"
+    )
+
     cases, classes
 end
 
@@ -198,6 +255,10 @@ function summarise_cases(cases::Vector{BMMCase})
     Ds = getfield.(allmodes, :Dm) .* 1e9
     sig = getfield.(allmodes, :lnsig)
     kap = getfield.(allmodes, :kappa)
+    scrit_pct = Float64[]
+    for c in cases, m in c.modes
+        push!(scrit_pct, 100.0 * _critical_supersaturation(m.Dm, m.kappa, c.tinit))
+    end
     println("Synthetic BMM ensemble")
     println("  cases: $(length(cases)); modes/case: $(minimum(nm))-$(maximum(nm))")
     println("  w: $(minimum(ws))-$(maximum(ws)) m s^-1")
@@ -207,6 +268,7 @@ function summarise_cases(cases::Vector{BMMCase})
     println("  mode Dm: $(minimum(Ds))-$(maximum(Ds)) nm")
     println("  mode lnsig: $(minimum(sig))-$(maximum(sig))")
     println("  mode kappa: $(minimum(kap))-$(maximum(kap))")
+    println("  mode median Scrit: $(minimum(scrit_pct))-$(maximum(scrit_pct)) %")
 end
 
 function _nearest_profile(q, hgrid, field::Symbol)
