@@ -23,26 +23,30 @@ device_request in ("auto", "cpu", "gpu") ||
 
 function _try_cuda(; verbose::Bool=false)
     try
+        # CUDA is an optional runtime backend. Loading it dynamically from a
+        # function requires invokelatest for the first call because the newly
+        # loaded methods live in a newer Julia world age.
         @eval using CUDA
-        return CUDA.functional()
+        return Base.invokelatest(CUDA.functional)
     catch err
         verbose && @warn "CUDA detection failed" exception=(err, catch_backtrace())
         return false
     end
 end
 
-use_gpu = device_request == "gpu" ? true :
-          device_request == "cpu" ? false : _try_cuda()
+# Probe CUDA before entering the device-selection block. Keeping this as a
+# separate top-level statement avoids world-age issues for subsequent CUDA calls.
+cuda_ok = device_request == "cpu" ? false :
+          _try_cuda(; verbose=(device_request == "gpu"))
+
+if device_request == "gpu" && !cuda_ok
+    error("DEVICE=gpu requested but CUDA is unavailable. Run `make gpu-check` for diagnostics.")
+end
+
+use_gpu = device_request == "gpu" || (device_request == "auto" && cuda_ok)
 
 if use_gpu
     kind == "profile" || error("GPU training is currently supported for the profile surrogate only")
-    if device_request == "gpu" && !_try_cuda(; verbose=true)
-        error("DEVICE=gpu requested but CUDA is unavailable. Run `make gpu-check` for diagnostics.")
-    end
-    # In auto mode _try_cuda() has already loaded CUDA; in forced GPU mode
-    # ensure it is loaded before asking Flux for a GPU device. Dense layers use
-    # CUDA/cuBLAS directly; cuDNN is not required for this surrogate.
-    @eval using CUDA
     CUDA.allowscalar(false)
     device = Flux.gpu_device(; force=true)
     println("training device: GPU ($(CUDA.name(CUDA.device())))")
