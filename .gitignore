@@ -1,9 +1,23 @@
+# macOS / editor metadata
+.DS_Store
+*~
+
+# Local smoke-test files
 myfile.nc
 myfile2.nc
 write_read.json
-.DS_Store
-synthetic_bmm*
-*.csv
-*.bson
-surrogate_comparison
 
+# Generated datasets, models, plots and run artefacts
+/data/
+/models/
+/results/
+/scratch/
+
+# Legacy generated outputs if scripts are run directly from julia/
+julia/synthetic_bmm*
+julia/*.bson
+julia/*.csv
+julia/surrogate_comparison/
+
+# BMM is a separately maintained git subtree. Do not add parent-repo cleanup
+# rules for bmm/ build products here; its own repository controls that tree.

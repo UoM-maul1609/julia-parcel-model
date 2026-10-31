@@ -28,6 +28,10 @@ nplots = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 8
 kind in ("profile", "neuralode", "both") ||
     error("model kind must be 'profile', 'neuralode', or 'both'")
 
+model_dir = get(ENV, "MODEL_DIR", ".")
+results_root = get(ENV, "RESULTS_DIR", ".")
+mkpath(results_root)
+
 cases = read_cases(path)
 split = split_cases(cases; seed=seed)
 test = split.test
@@ -96,13 +100,15 @@ end
 
 models = Dict{String,Any}()
 if kind in ("profile", "both")
-    isfile("profile_surrogate.bson") || error("profile_surrogate.bson not found")
-    p, m = load_profile_model("profile_surrogate.bson")
+    model_path = joinpath(model_dir, "profile_surrogate.bson")
+    isfile(model_path) || error("profile surrogate not found at $model_path")
+    p, m = load_profile_model(model_path)
     models["profile"] = (p=p, m=m, predict=(c -> predict_profile(m, p, c)))
 end
 if kind in ("neuralode", "both")
-    isfile("neuralode_surrogate.bson") || error("neuralode_surrogate.bson not found")
-    p, m = load_neuralode_model("neuralode_surrogate.bson")
+    model_path = joinpath(model_dir, "neuralode_surrogate.bson")
+    isfile(model_path) || error("neuralODE surrogate not found at $model_path")
+    p, m = load_neuralode_model(model_path)
     models["neuralODE"] = (p=p, m=m, predict=(c -> predict_neuralode(m, p, c)))
 end
 
@@ -171,7 +177,7 @@ for (name, pc) in cache
 end
 
 selected = select_cases(test, nplots)
-outdir = "surrogate_comparison"
+outdir = joinpath(results_root, "surrogate_comparison")
 mkpath(outdir)
 
 open(joinpath(outdir, "selected_cases.txt"), "w") do io

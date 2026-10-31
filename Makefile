@@ -1,17 +1,86 @@
+# Julia parcel model / BMM surrogate
+#
+# bmm/ is a git subtree from the separate Bin Microphysics Model repository.
+# This wrapper invokes it but does not modify its Makefiles or source layout.
+
 BMM_DIR ?= bmm
 JULIA ?= julia
-NETCDF_FOR ?= $(shell nf-config --prefix 2>/dev/null)
-NETCDF_C ?= $(shell nc-config --prefix 2>/dev/null)
-BMM_DATASET ?= synthetic_bmm.nc
+
+CASES ?= 256
+MAX_MODES ?= 4
+WORKERS ?= 64
 SURROGATE_SEED ?= 20260831
 PROFILE_EPOCHS ?= 150
 NEURALODE_EPOCHS ?= 40
+NPLOTS ?= 8
 
-.PHONY: bmm clean-bmm julia-instantiate julia-test smoke synthetic-pilot \
-        analyse-dataset train-profile train-neuralode compare-surrogates
+DATA_DIR ?= data
+MODEL_DIR ?= models
+RESULTS_DIR ?= results
+BMM_DATASET ?= $(DATA_DIR)/synthetic_bmm.nc
+
+UNAME_S := $(shell uname -s)
+
+# The BMM subtree's defaults work on macOS.  On Ubuntu the following command-
+# line overrides are required.  Passing them here leaves bmm/ untouched.
+ifeq ($(UNAME_S),Linux)
+BMM_BUILD_ARGS = \
+	NETCDFLIB=-L/usr/lib/x86_64-linux-gnu/ \
+	NETCDFMOD=/usr/include/ \
+	FFLAGS='-O2 -w -o' \
+	FFLAGS2='-O2 -w -o' \
+	FFLAGSOMP='-O2 -w -o'
+else
+BMM_BUILD_ARGS =
+endif
+
+.PHONY: help setup build bmm clean clean-bmm test julia-instantiate julia-test \
+        smoke generate synthetic-pilot analyse analyse-dataset \
+        train train-profile train-neuralode compare compare-surrogates dirs
+
+help:
+	@echo ""
+	@echo "BMM-trained Julia cloud-activation surrogate"
+	@echo ""
+	@echo "Quick start:"
+	@echo "  make setup                 Instantiate the Julia environment"
+	@echo "  make build                 Build BMM (macOS/Linux detected automatically)"
+	@echo "  make smoke                 Test Julia -> BMM -> NetCDF -> Julia"
+	@echo ""
+	@echo "Main workflow:"
+	@echo "  make generate              Generate synthetic BMM training data"
+	@echo "  make analyse               Summarise/check the generated dataset"
+	@echo "  make train                 Train the profile surrogate"
+	@echo "  make compare               Evaluate and plot held-out cases"
+	@echo ""
+	@echo "Useful overrides:"
+	@echo "  CASES=256                  Number of synthetic BMM cases"
+	@echo "  WORKERS=64                 Maximum concurrent BMM processes"
+	@echo "  MAX_MODES=4                Maximum aerosol modes per case"
+	@echo "  SURROGATE_SEED=20260831    Reproducible sampling/train split seed"
+	@echo "  PROFILE_EPOCHS=150         Profile-network training epochs"
+	@echo "  BMM_DATASET=data/file.nc   Dataset path from repository root"
+	@echo ""
+	@echo "Example:"
+	@echo "  make generate CASES=2000 WORKERS=128"
+	@echo ""
+	@echo "Detected platform: $(UNAME_S)"
+	@echo ""
+
+dirs:
+	@mkdir -p $(DATA_DIR) $(MODEL_DIR) $(RESULTS_DIR) scratch
+
+setup: dirs julia-instantiate
+build: bmm
+test: julia-test
+generate: synthetic-pilot
+analyse: analyse-dataset
+train: train-profile
+compare: compare-surrogates
+clean: clean-bmm
 
 bmm:
-	$(MAKE) -C $(BMM_DIR) NETCDF_FOR="$(NETCDF_FOR)" NETCDF_C="$(NETCDF_C)" main.exe
+	$(MAKE) -C $(BMM_DIR) $(BMM_BUILD_ARGS)
 
 clean-bmm:
 	$(MAKE) -C $(BMM_DIR) cleanall
@@ -25,17 +94,30 @@ julia-test:
 smoke: bmm julia-instantiate
 	cd julia && BMM_EXE=../$(BMM_DIR)/main.exe $(JULIA) --project=. smoke.jl
 
-synthetic-pilot: bmm julia-instantiate
-	cd julia && BMM_EXE=../$(BMM_DIR)/main.exe $(JULIA) --project=. -t auto generate_synthetic_dataset.jl 256 $(BMM_DATASET) 4 $(SURROGATE_SEED)
+synthetic-pilot: bmm julia-instantiate dirs
+	cd julia && \
+	BMM_EXE=../$(BMM_DIR)/main.exe \
+	BMM_WORKERS=$(WORKERS) \
+	$(JULIA) --project=. -t $(WORKERS) generate_synthetic_dataset.jl \
+	$(CASES) ../$(BMM_DATASET) $(MAX_MODES) $(SURROGATE_SEED) $(WORKERS)
 
 analyse-dataset: julia-instantiate
-	cd julia && $(JULIA) --project=. analyse_dataset.jl $(BMM_DATASET)
+	cd julia && $(JULIA) --project=. analyse_dataset.jl ../$(BMM_DATASET)
 
-train-profile: julia-instantiate
-	cd julia && $(JULIA) --project=. train_surrogate.jl $(BMM_DATASET) profile $(PROFILE_EPOCHS) $(SURROGATE_SEED)
+train-profile: julia-instantiate dirs
+	cd julia && \
+	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) \
+	$(JULIA) --project=. train_surrogate.jl \
+	../$(BMM_DATASET) profile $(PROFILE_EPOCHS) $(SURROGATE_SEED)
 
-train-neuralode: julia-instantiate
-	cd julia && $(JULIA) --project=. train_surrogate.jl $(BMM_DATASET) neuralode $(NEURALODE_EPOCHS) $(SURROGATE_SEED)
+train-neuralode: julia-instantiate dirs
+	cd julia && \
+	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) \
+	$(JULIA) --project=. train_surrogate.jl \
+	../$(BMM_DATASET) neuralode $(NEURALODE_EPOCHS) $(SURROGATE_SEED)
 
-compare-surrogates: julia-instantiate
-	cd julia && $(JULIA) --project=. compare_surrogates.jl $(BMM_DATASET) $(SURROGATE_SEED) both 8
+compare-surrogates: julia-instantiate dirs
+	cd julia && \
+	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) \
+	$(JULIA) --project=. compare_surrogates.jl \
+	../$(BMM_DATASET) $(SURROGATE_SEED) profile $(NPLOTS)

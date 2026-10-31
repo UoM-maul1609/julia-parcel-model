@@ -376,13 +376,18 @@ function write_dataset(path::AbstractString, cases::Vector{BMMCase}, classes,
 end
 
 function run_and_write_dataset(path::AbstractString; cfg::SamplingConfig=SamplingConfig(),
-                               exe::AbstractString=BMM.default_bmm_exe())
+                               exe::AbstractString=BMM.default_bmm_exe(),
+                               workers::Integer=Threads.nthreads())
     cases, classes = sample_cases(cfg)
     summarise_cases(cases)
-    println("Running BMM using $(Threads.nthreads()) Julia worker threads...")
+    workers > 0 || throw(ArgumentError("workers must be positive"))
+    actual_workers = min(Int(workers), Threads.nthreads(), length(cases))
+    println("Running BMM with up to $actual_workers concurrent processes " *
+            "($(Threads.nthreads()) Julia threads available)...")
     failure_dir = get(ENV, "BMM_FAILURE_DIR", splitext(abspath(path))[1] * "_failures")
     println("Failed-case diagnostics will be retained under: $failure_dir")
-    results = BMM.run_bmm_batch(cases; exe=exe, failure_dir=failure_dir)
+    results = BMM.run_bmm_batch(cases; exe=exe, failure_dir=failure_dir,
+                                max_workers=actual_workers)
     write_dataset(path, cases, classes, results; cfg=cfg)
 end
 

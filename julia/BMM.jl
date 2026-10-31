@@ -341,28 +341,66 @@ function run_bmm(c::BMMCase; exe::AbstractString=default_bmm_exe(),
 end
 
 function run_bmm_batch(cases::Vector{BMMCase}; exe::AbstractString=default_bmm_exe(),
-                       failure_dir::Union{Nothing,AbstractString}=nothing, kwargs...)
-    results = Vector{Any}(undef, length(cases))
-    Threads.@threads for i in eachindex(cases)
-        wd = mktempdir()
-        try
-            results[i] = run_bmm(cases[i]; exe=exe, workdir=wd, kwargs...)
-        catch err
-            saved = nothing
-            if failure_dir !== nothing
-                saved = joinpath(abspath(failure_dir), "case_" * lpad(string(i), 4, '0'))
+                       failure_dir::Union{Nothing,AbstractString}=nothing,
+                       max_workers::Integer=Threads.nthreads(),
+                       progress::Bool=true, kwargs...)
+    ncases = length(cases)
+    ncases == 0 && return Any[]
+    max_workers > 0 || throw(ArgumentError("max_workers must be positive"))
+    nworkers = min(Int(max_workers), ncases, Threads.nthreads())
+
+    results = Vector{Any}(undef, ncases)
+    jobs = Channel{Int}(ncases)
+    for i in eachindex(cases)
+        put!(jobs, i)
+    end
+    close(jobs)
+
+    state_lock = ReentrantLock()
+    completed = Ref(0)
+    failed = Ref(0)
+    running = Ref(0)
+    report_every = max(1, cld(ncases, 20))
+
+    progress && println("BMM ensemble: $ncases cases, up to $nworkers concurrent workers")
+
+    @sync for _ in 1:nworkers
+        Threads.@spawn begin
+            for i in jobs
+                lock(state_lock) do
+                    running[] += 1
+                end
+                wd = mktempdir()
+                ok = true
                 try
-                    _copy_failure_files(wd, saved, cases[i], i, err)
-                catch save_err
-                    @warn "Could not save diagnostics for failed BMM case $i" exception=(save_err, catch_backtrace())
+                    results[i] = run_bmm(cases[i]; exe=exe, workdir=wd, kwargs...)
+                catch err
+                    ok = false
+                    saved = nothing
+                    if failure_dir !== nothing
+                        saved = joinpath(abspath(failure_dir), "case_" * lpad(string(i), 4, '0'))
+                        try
+                            _copy_failure_files(wd, saved, cases[i], i, err)
+                        catch save_err
+                            @warn "Could not save diagnostics for failed BMM case $i" exception=(save_err, catch_backtrace())
+                        end
+                    end
+                    msg = "BMM case $i failed\n" * case_diagnostics(cases[i]; case_index=i)
+                    saved === nothing || (msg *= "  retained failure files: $saved\n")
+                    @warn msg exception=(err, catch_backtrace())
+                    results[i] = nothing
+                finally
+                    rm(wd; recursive=true, force=true)
+                    lock(state_lock) do
+                        running[] -= 1
+                        completed[] += 1
+                        ok || (failed[] += 1)
+                        if progress && (completed[] == 1 || completed[] % report_every == 0 || completed[] == ncases)
+                            println("BMM ensemble: $(completed[])/$ncases complete | $(running[]) running | $(failed[]) failed")
+                        end
+                    end
                 end
             end
-            msg = "BMM case $i failed\n" * case_diagnostics(cases[i]; case_index=i)
-            saved === nothing || (msg *= "  retained failure files: $saved\n")
-            @warn msg exception=(err, catch_backtrace())
-            results[i] = nothing
-        finally
-            rm(wd; recursive=true, force=true)
         end
     end
     results
