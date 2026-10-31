@@ -15,32 +15,29 @@ epochs = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : default_epochs
 seed = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 20260831
 
 # Training device. DEVICE=auto is the user-facing default: use CUDA when the
-# optional GPU packages are installed and functional, otherwise use CPU.
+# optional CUDA package is installed and functional, otherwise use CPU.
 # DEVICE=gpu forces CUDA and errors if it is unavailable; DEVICE=cpu forces CPU.
 device_request = lowercase(get(ENV, "DEVICE", "auto"))
 device_request in ("auto", "cpu", "gpu") ||
     error("DEVICE must be 'auto', 'cpu' or 'gpu'; got '$device_request'")
 
-function _try_cuda(; verbose::Bool=false)
+# Load CUDA at top level if it is installed.  Do not load it dynamically from
+# inside a function: on Julia 1.12 that can trigger a world-age error before
+# CUDA.functional() is called.  Keeping CUDA optional preserves CPU/macOS use.
+cuda_loaded = false
+if device_request != "cpu" && Base.find_package("CUDA") !== nothing
     try
-        # CUDA is an optional runtime backend. Loading it dynamically from a
-        # function requires invokelatest for the first call because the newly
-        # loaded methods live in a newer Julia world age.
         @eval using CUDA
-        return Base.invokelatest(CUDA.functional)
+        cuda_loaded = true
     catch err
-        verbose && @warn "CUDA detection failed" exception=(err, catch_backtrace())
-        return false
+        device_request == "gpu" && @warn "CUDA package could not be loaded" exception=(err, catch_backtrace())
     end
 end
 
-# Probe CUDA before entering the device-selection block. Keeping this as a
-# separate top-level statement avoids world-age issues for subsequent CUDA calls.
-cuda_ok = device_request == "cpu" ? false :
-          _try_cuda(; verbose=(device_request == "gpu"))
+cuda_ok = cuda_loaded && CUDA.functional()
 
 if device_request == "gpu" && !cuda_ok
-    error("DEVICE=gpu requested but CUDA is unavailable. Run `make gpu-check` for diagnostics.")
+    error("DEVICE=gpu requested but CUDA is unavailable or not functional. Run `make gpu-setup` and `make gpu-check`.")
 end
 
 use_gpu = device_request == "gpu" || (device_request == "auto" && cuda_ok)
@@ -53,7 +50,9 @@ if use_gpu
 else
     device = Flux.cpu_device()
     if device_request == "auto"
-        println("training device: CPU (no functional CUDA backend detected)")
+        println(cuda_loaded ?
+            "training device: CPU (CUDA installed but not functional)" :
+            "training device: CPU (CUDA package not installed)")
     else
         println("training device: CPU")
     end
