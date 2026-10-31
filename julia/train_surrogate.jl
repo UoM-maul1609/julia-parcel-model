@@ -4,6 +4,7 @@ using .SurrogateData
 using .SetSurrogate
 using Random
 using Flux
+using CUDA
 
 # Usage:
 #   julia --project=. train_surrogate.jl synthetic_bmm.nc profile [epochs] [seed]
@@ -14,30 +15,18 @@ default_epochs = kind == "neuralode" ? 40 : 150
 epochs = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : default_epochs
 seed = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 20260831
 
-# Training device. DEVICE=auto is the user-facing default: use CUDA when the
-# optional CUDA package is installed and functional, otherwise use CPU.
-# DEVICE=gpu forces CUDA and errors if it is unavailable; DEVICE=cpu forces CPU.
+# Training device. DEVICE=auto is the user-facing default: use CUDA when
+# functional, otherwise use CPU. DEVICE=gpu forces CUDA and errors if it is
+# unavailable; DEVICE=cpu forces CPU. CUDA is a declared project dependency,
+# so load it normally at top level rather than dynamically inside a function.
 device_request = lowercase(get(ENV, "DEVICE", "auto"))
 device_request in ("auto", "cpu", "gpu") ||
     error("DEVICE must be 'auto', 'cpu' or 'gpu'; got '$device_request'")
 
-# Load CUDA at top level if it is installed.  Do not load it dynamically from
-# inside a function: on Julia 1.12 that can trigger a world-age error before
-# CUDA.functional() is called.  Keeping CUDA optional preserves CPU/macOS use.
-cuda_loaded = false
-if device_request != "cpu" && Base.find_package("CUDA") !== nothing
-    try
-        @eval using CUDA
-        cuda_loaded = true
-    catch err
-        device_request == "gpu" && @warn "CUDA package could not be loaded" exception=(err, catch_backtrace())
-    end
-end
-
-cuda_ok = cuda_loaded && CUDA.functional()
+cuda_ok = device_request == "cpu" ? false : CUDA.functional()
 
 if device_request == "gpu" && !cuda_ok
-    error("DEVICE=gpu requested but CUDA is unavailable or not functional. Run `make gpu-setup` and `make gpu-check`.")
+    error("DEVICE=gpu requested but CUDA is not functional. Run `make gpu-check`.")
 end
 
 use_gpu = device_request == "gpu" || (device_request == "auto" && cuda_ok)
@@ -49,13 +38,9 @@ if use_gpu
     println("training device: GPU ($(CUDA.name(CUDA.device())))")
 else
     device = Flux.cpu_device()
-    if device_request == "auto"
-        println(cuda_loaded ?
-            "training device: CPU (CUDA installed but not functional)" :
-            "training device: CPU (CUDA package not installed)")
-    else
-        println("training device: CPU")
-    end
+    println(device_request == "auto" ?
+        "training device: CPU (CUDA not functional)" :
+        "training device: CPU")
 end
 
 model_dir = get(ENV, "MODEL_DIR", ".")
