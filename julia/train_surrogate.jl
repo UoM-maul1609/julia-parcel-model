@@ -21,12 +21,12 @@ device_request = lowercase(get(ENV, "DEVICE", "auto"))
 device_request in ("auto", "cpu", "gpu") ||
     error("DEVICE must be 'auto', 'cpu' or 'gpu'; got '$device_request'")
 
-function _try_cuda()
+function _try_cuda(; verbose::Bool=false)
     try
         @eval using CUDA
-        @eval using cuDNN
         return CUDA.functional()
-    catch
+    catch err
+        verbose && @warn "CUDA detection failed" exception=(err, catch_backtrace())
         return false
     end
 end
@@ -36,13 +36,13 @@ use_gpu = device_request == "gpu" ? true :
 
 if use_gpu
     kind == "profile" || error("GPU training is currently supported for the profile surrogate only")
-    if device_request == "gpu" && !_try_cuda()
-        error("DEVICE=gpu requested but CUDA is unavailable. Run `make gpu-setup` and `make gpu-check`.")
+    if device_request == "gpu" && !_try_cuda(; verbose=true)
+        error("DEVICE=gpu requested but CUDA is unavailable. Run `make gpu-check` for diagnostics.")
     end
-    # In auto mode _try_cuda() has already loaded these packages; in forced
-    # GPU mode ensure they are loaded before asking Flux for a GPU device.
+    # In auto mode _try_cuda() has already loaded CUDA; in forced GPU mode
+    # ensure it is loaded before asking Flux for a GPU device. Dense layers use
+    # CUDA/cuBLAS directly; cuDNN is not required for this surrogate.
     @eval using CUDA
-    @eval using cuDNN
     CUDA.allowscalar(false)
     device = Flux.gpu_device(; force=true)
     println("training device: GPU ($(CUDA.name(CUDA.device())))")
