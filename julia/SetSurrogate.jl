@@ -167,10 +167,12 @@ Zygote.@nograd _mode_features
 Zygote.@nograd _mode_weights
 Zygote.@nograd _bulk_features
 
-function aerosol_context(encoder, c::MLCase)
-    embeddings = encoder(_mode_features(c))
-    pooled = embeddings * _mode_weights(c)
-    vcat(pooled, _bulk_features(c))
+function aerosol_context(encoder, c::MLCase; device=identity)
+    features = device(_mode_features(c))
+    weights = device(_mode_weights(c))
+    embeddings = encoder(features)
+    pooled = embeddings * weights
+    vcat(pooled, device(_bulk_features(c)))
 end
 
 forcing_w(c::MLCase, hhat) = Float32(log(max(c.w, W_FLOOR)))
@@ -244,22 +246,22 @@ function build_neuralode_model(; embed_dim::Int=24, hidden::Int=96, hscale::Real
     p, NeuralODESurrogate(re, embed_dim, hidden, Float32(hscale))
 end
 
-function _profile_point(core, ctx, c::MLCase, i::Int, h::Real, hscale::Real)
+function _profile_point(core, ctx, c::MLCase, i::Int, h::Real, hscale::Real; device=identity)
     hhat = Float32(h / hscale)
-    raw = core.head(vcat(ctx, forcing_w(c, hhat), thermo_features(c, i),
-                         height_features(hhat)))
+    local_features = vcat(Float32[forcing_w(c, hhat)], thermo_features(c, i), height_features(hhat))
+    raw = core.head(vcat(ctx, device(local_features)))
     if abs(hhat) <= 1f-7
         # Initial hydrated aerosol liquid and extinction are learned. Activation
         # is exactly zero at the initial RH=0.95 parcel state.
-        return Float32[raw[1], FACT_ZERO_LATENT, raw[3]]
+        return vcat(view(raw, 1:1), device(Float32[FACT_ZERO_LATENT]), view(raw, 3:3))
     end
     raw
 end
 
-function _profile_transformed(m::ProfileSurrogate, p, c::MLCase)
+function _profile_transformed(m::ProfileSurrogate, p, c::MLCase; device=identity)
     core = m.re(p)
-    ctx = aerosol_context(core.encoder, c)
-    reduce(hcat, (_profile_point(core, ctx, c, i, c.height[i], m.hscale)
+    ctx = aerosol_context(core.encoder, c; device=device)
+    reduce(hcat, (_profile_point(core, ctx, c, i, c.height[i], m.hscale; device=device)
                   for i in eachindex(c.height)))
 end
 
@@ -281,16 +283,16 @@ function _trajectory_loss(pred, truth)
     point + 0.15f0*peak + 0.05f0*final
 end
 
-profile_loss(m::ProfileSurrogate, p, c::MLCase) =
-    _trajectory_loss(_profile_transformed(m, p, c), _truth_matrix(c))
+profile_loss(m::ProfileSurrogate, p, c::MLCase; device=identity) =
+    _trajectory_loss(_profile_transformed(m, p, c; device=device), device(_truth_matrix(c)))
 
 """Solve the v3 Neural ODE in normalized height."""
 function _solve_neuralode(m::NeuralODESurrogate, p, c::MLCase;
-                          solver=Tsit5(), saveat=c.height)
+                          solver=Tsit5(), saveat=c.height, device=identity)
     core0 = m.re(p)
-    ctx0 = aerosol_context(core0.encoder, c)
-    w0 = forcing_w(c, 0f0)
-    init = core0.init_net(vcat(ctx0, w0, thermo_features(c, 1)))
+    ctx0 = aerosol_context(core0.encoder, c; device=device)
+    init_features = vcat(Float32[forcing_w(c, 0f0)], thermo_features(c, 1))
+    init = core0.init_net(vcat(ctx0, device(init_features)))
     y0 = Float32[init[1], FACT_ZERO_LATENT, init[2]]
     u0 = vcat(y0, ctx0)
     nctx = length(ctx0)
@@ -302,8 +304,9 @@ function _solve_neuralode(m::NeuralODESurrogate, p, c::MLCase;
         h = Float32(hhat) * m.hscale
         Tloc = _linear_interp(h, c.height, c.T)
         Ploc = _linear_interp(h, c.height, c.P)
-        dy = core.rhs_net(vcat(y, ctx, forcing_w(c, hhat),
-                               thermo_features(Tloc, Ploc), height_features(hhat)))
+        rhs_features = vcat(Float32[forcing_w(c, hhat)],
+                            thermo_features(Tloc, Ploc), height_features(hhat))
+        dy = core.rhs_net(vcat(y, ctx, device(rhs_features)))
         vcat(dy, zeros(eltype(dy), nctx))
     end
 
@@ -315,16 +318,16 @@ function _solve_neuralode(m::NeuralODESurrogate, p, c::MLCase;
           abstol=1f-5, reltol=1f-5)
 end
 
-function neuralode_loss(m::NeuralODESurrogate, p, c::MLCase)
-    sol = _solve_neuralode(m, p, c)
+function neuralode_loss(m::NeuralODESurrogate, p, c::MLCase; device=identity)
+    sol = _solve_neuralode(m, p, c; device=device)
     SciMLBase.successful_retcode(sol) || return 1.0f6
     pred = hcat((Float32.(view(u, 1:3)) for u in sol.u)...)
-    _trajectory_loss(pred, _truth_matrix(c))
+    _trajectory_loss(pred, device(_truth_matrix(c)))
 end
 
 function _train_flat!(p, model, cases, lossfun; epochs::Int, lr::Real,
                       batchsize::Int, val_cases, rng, label::String,
-                      grad_clip::Real=10.0, patience::Int=30,
+                      device=identity, grad_clip::Real=10.0, patience::Int=30,
                       min_delta::Real=1e-4)
     isempty(cases) && throw(ArgumentError("no training cases"))
     opt = Flux.setup(Adam(Float32(lr)), p)
@@ -340,7 +343,7 @@ function _train_flat!(p, model, cases, lossfun; epochs::Int, lr::Real,
             ix = perm[s:min(s + batchsize - 1, n)]
             batch = cases[ix]
             loss, grad = Flux.withgradient(p) do theta
-                mean(lossfun(model, theta, c) for c in batch)
+                mean(lossfun(model, theta, c; device=device) for c in batch)
             end
             g = grad[1]
             gnorm = sqrt(sum(abs2, g))
@@ -353,7 +356,7 @@ function _train_flat!(p, model, cases, lossfun; epochs::Int, lr::Real,
 
         trainloss = total / n
         valloss = (val_cases === nothing || isempty(val_cases)) ? NaN :
-                  mean(lossfun(model, p, c) for c in val_cases)
+                  mean(lossfun(model, p, c; device=device) for c in val_cases)
 
         if isfinite(valloss)
             if valloss < best_val - min_delta
@@ -382,18 +385,18 @@ function _train_flat!(p, model, cases, lossfun; epochs::Int, lr::Real,
 end
 
 function train_profile!(p, m, cases; epochs=150, lr=7.5e-4, batchsize=16,
-                        val_cases=nothing, rng=Random.default_rng(),
+                        val_cases=nothing, rng=Random.default_rng(), device=identity,
                         grad_clip=10.0, patience=30)
     _train_flat!(p, m, cases, profile_loss; epochs=epochs, lr=lr,
-                 batchsize=batchsize, val_cases=val_cases, rng=rng,
+                 batchsize=batchsize, val_cases=val_cases, rng=rng, device=device,
                  label="profile-v3", grad_clip=grad_clip, patience=patience)
 end
 
 function train_neuralode!(p, m, cases; epochs=40, lr=4e-4, batchsize=4,
-                          val_cases=nothing, rng=Random.default_rng(),
+                          val_cases=nothing, rng=Random.default_rng(), device=identity,
                           grad_clip=5.0, patience=20)
     _train_flat!(p, m, cases, neuralode_loss; epochs=epochs, lr=lr,
-                 batchsize=batchsize, val_cases=val_cases, rng=rng,
+                 batchsize=batchsize, val_cases=val_cases, rng=rng, device=device,
                  label="neuralODE-v3", grad_clip=grad_clip, patience=patience)
 end
 

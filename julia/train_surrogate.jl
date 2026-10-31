@@ -3,6 +3,7 @@ include("SetSurrogate.jl")
 using .SurrogateData
 using .SetSurrogate
 using Random
+using Flux
 
 # Usage:
 #   julia --project=. train_surrogate.jl synthetic_bmm.nc profile [epochs] [seed]
@@ -12,6 +13,47 @@ kind = lowercase(length(ARGS) >= 2 ? ARGS[2] : "profile")
 default_epochs = kind == "neuralode" ? 40 : 150
 epochs = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : default_epochs
 seed = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 20260831
+
+# Training device. DEVICE=auto is the user-facing default: use CUDA when the
+# optional GPU packages are installed and functional, otherwise use CPU.
+# DEVICE=gpu forces CUDA and errors if it is unavailable; DEVICE=cpu forces CPU.
+device_request = lowercase(get(ENV, "DEVICE", "auto"))
+device_request in ("auto", "cpu", "gpu") ||
+    error("DEVICE must be 'auto', 'cpu' or 'gpu'; got '$device_request'")
+
+function _try_cuda()
+    try
+        @eval using CUDA
+        @eval using cuDNN
+        return CUDA.functional()
+    catch
+        return false
+    end
+end
+
+use_gpu = device_request == "gpu" ? true :
+          device_request == "cpu" ? false : _try_cuda()
+
+if use_gpu
+    kind == "profile" || error("GPU training is currently supported for the profile surrogate only")
+    if device_request == "gpu" && !_try_cuda()
+        error("DEVICE=gpu requested but CUDA is unavailable. Run `make gpu-setup` and `make gpu-check`.")
+    end
+    # In auto mode _try_cuda() has already loaded these packages; in forced
+    # GPU mode ensure they are loaded before asking Flux for a GPU device.
+    @eval using CUDA
+    @eval using cuDNN
+    CUDA.allowscalar(false)
+    device = Flux.gpu_device(; force=true)
+    println("training device: GPU ($(CUDA.name(CUDA.device())))")
+else
+    device = Flux.cpu_device()
+    if device_request == "auto"
+        println("training device: CPU (no functional CUDA backend detected)")
+    else
+        println("training device: CPU")
+    end
+end
 
 model_dir = get(ENV, "MODEL_DIR", ".")
 results_dir = get(ENV, "RESULTS_DIR", ".")
@@ -36,7 +78,9 @@ Random.seed!(seed)
 
 if kind == "profile"
     p, m = build_profile_model(hscale=hscale)
-    train_profile!(p, m, split.train; epochs=epochs, val_cases=split.val, rng=rng)
+    p = device(p)
+    train_profile!(p, m, split.train; epochs=epochs, val_cases=split.val, rng=rng, device=device)
+    p = Flux.cpu(p)
     println("train metrics: ", evaluate_profile(m, p, split.train))
     println("validation metrics: ", evaluate_profile(m, p, split.val))
     println("TEST metrics: ", evaluate_profile(m, p, split.test))
@@ -45,7 +89,7 @@ if kind == "profile"
     println("saved $model_path (surrogate format v3)")
 elseif kind == "neuralode"
     p, m = build_neuralode_model(hscale=hscale)
-    train_neuralode!(p, m, split.train; epochs=epochs, val_cases=split.val, rng=rng)
+    train_neuralode!(p, m, split.train; epochs=epochs, val_cases=split.val, rng=rng, device=device)
     println("train metrics: ", evaluate_neuralode(m, p, split.train))
     println("validation metrics: ", evaluate_neuralode(m, p, split.val))
     println("TEST metrics: ", evaluate_neuralode(m, p, split.test))

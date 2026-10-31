@@ -1,85 +1,73 @@
-# Julia parcel model: BMM-trained cloud activation surrogate
+# Julia parcel model
 
-This repository uses the **Bin Microphysics Model (BMM)** to generate reference
-parcel trajectories and Julia/Flux/SciML to train fast cloud-activation
-surrogates.
+This project uses the **Bin Microphysics Model (BMM)** to generate reference
+cloud-parcel trajectories and Julia/Flux to develop fast learned
+parameterisations of cloud activation and condensational growth.
 
-The repository is deliberately organised so that the common workflow is driven
-from the top-level `Makefile`. You should not normally need to remember the
-platform-specific BMM build command or work from inside `julia/`.
-
-> **Important:** `bmm/` is a git subtree imported from the separate
-> Bin Microphysics Model repository. The parent project invokes it, but does
-> not reorganise or maintain the internals of that subtree.
-
-## Quick start
-
-From the repository root:
+The repository is intended to be operated from its top directory. The common
+workflow is deliberately short:
 
 ```bash
 make setup
 make build
 make smoke
-```
-
-Then the normal surrogate workflow is:
-
-```bash
 make generate
 make analyse
 make train
 make compare
 ```
 
-Run `make help` at any time to see the available commands and overrides.
+Run `make help` whenever you need a reminder.
 
-## Recommended PowerEdge workflow
+> `bmm/` is a **git subtree from the separate Bin Microphysics Model
+> repository**. The parent project builds and runs it, but does not reorganise
+> or maintain the internals of that subtree.
 
-The synthetic BMM cases are independent. On a many-core Linux server, choose
-how many BMM processes may run concurrently rather than simply using every
-logical CPU:
+## 1. First-time setup
+
+### Julia and system dependencies
+
+You need Julia 1.10–1.12, `make`, `gfortran`, and the NetCDF C and Fortran
+development libraries.
+
+On Ubuntu/Debian:
 
 ```bash
-make generate CASES=256 WORKERS=64
+sudo apt update
+sudo apt install -y build-essential gfortran \
+    libnetcdf-dev libnetcdff-dev netcdf-bin git curl
 ```
 
-For a larger ensemble:
+Check the installation:
 
 ```bash
-make generate CASES=5000 WORKERS=128
+julia --version
+gfortran --version
+nc-config --version
+nf-config --version
 ```
 
-The generator uses a dynamic worker queue, so when one BMM case finishes that
-worker immediately takes the next case. Progress is reported while the
-ensemble is running, including completed, running and failed cases.
+Instantiate the Julia environment:
 
-`WORKERS` is also used as the Julia thread count for generation. The effective
-number of concurrent BMM jobs is capped by the number of cases and available
-Julia threads.
-
-## Repository layout
-
-```text
-julia-parcel-model/
-├── README.md             this file
-├── Makefile              user-facing build/workflow commands
-├── .gitignore
-├── LICENSE
-├── bmm/                  BMM git subtree; maintained separately
-├── julia/                Julia source + Project.toml/Manifest.toml
-├── configs/              parent-project example configuration
-├── scripts/              subtree/update helper scripts
-├── docs/                 historical/development notes
-├── data/                 generated datasets (gitignored)
-├── models/               trained surrogate weights (gitignored)
-├── results/              plots, splits and metrics (gitignored)
-└── scratch/              temporary local work (gitignored)
+```bash
+make setup
 ```
 
-Only `julia/` is a Julia package environment. There is intentionally no
-second `Project.toml` at repository root.
+### NVIDIA GPU training
 
-## Build BMM
+GPU support is optional. On an NVIDIA machine, install the Julia CUDA packages
+once:
+
+```bash
+make gpu-setup
+make gpu-check
+```
+
+`gpu-check` should report `CUDA functional = true`.
+
+The normal CPU environment remains usable on machines without an NVIDIA GPU.
+
+## 2. Build and test BMM
 
 Use the same command on macOS and Ubuntu:
 
@@ -87,28 +75,11 @@ Use the same command on macOS and Ubuntu:
 make build
 ```
 
-or equivalently:
+The top-level Makefile detects the operating system.
 
-```bash
-make bmm
-```
-
-The top-level Makefile detects the platform.
-
-### macOS
-
-The wrapper calls the BMM subtree's normal default build:
-
-```bash
-make -C bmm
-```
-
-so the existing BMM Makefile defaults are preserved.
-
-### Ubuntu / Linux
-
-The wrapper calls the BMM Makefile with the NetCDF/compiler settings currently
-required on the Ubuntu development machine:
+On macOS it simply calls the BMM subtree's own default build. On Ubuntu it
+passes the NetCDF/compiler settings currently required by the Linux
+development machine:
 
 ```bash
 make -C bmm \
@@ -119,206 +90,224 @@ make -C bmm \
   FFLAGSOMP='-O2 -w -o'
 ```
 
-These are command-line overrides only. **No Makefile or source file inside
-`bmm/` is changed by the wrapper.**
+These are command-line overrides only. **Nothing inside `bmm/` is modified.**
 
-## Prerequisites
-
-You need:
-
-- `make`, `gfortran` and standard GNU build tools;
-- NetCDF C and NetCDF-Fortran development libraries;
-- Julia 1.10, 1.11 or 1.12;
-- the Julia packages recorded in `julia/Project.toml` and
-  `julia/Manifest.toml`.
-
-On Ubuntu/Debian the system dependencies are typically:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential gfortran \
-    libnetcdf-dev libnetcdff-dev netcdf-bin git curl
-```
-
-Check the toolchain with:
-
-```bash
-gfortran --version
-nc-config --version
-nf-config --version
-julia --version
-make --version
-```
-
-Instantiate the Julia environment with:
-
-```bash
-make setup
-```
-
-## Smoke test
-
-After building, run:
+Then run the end-to-end smoke test:
 
 ```bash
 make smoke
 ```
 
-This exercises the complete integration path:
+A successful run exercises:
 
 ```text
 Julia -> BMM namelist -> BMM executable -> NetCDF -> Julia
 ```
 
-A successful run prints `BMM/Julia multimode smoke test OK`.
+and prints `BMM/Julia multimode smoke test OK`.
 
-## Generate a synthetic BMM dataset
+## 3. Generate BMM training data
 
-The default pilot is 256 cases, up to four aerosol modes, using seed
-`20260831`:
+The default pilot dataset contains 256 cases with one to four aerosol modes:
 
 ```bash
 make generate
 ```
 
-Equivalent explicit invocation:
+On the PowerEdge, a useful explicit command is:
 
 ```bash
-make generate CASES=256 MAX_MODES=4 WORKERS=64 SURROGATE_SEED=20260831
+make generate CASES=256 WORKERS=64
 ```
 
-The default output is:
+For a larger ensemble later:
+
+```bash
+make generate CASES=5000 WORKERS=128
+```
+
+`WORKERS` controls the maximum number of concurrent BMM processes. Generation
+uses a dynamic queue: when one BMM calculation completes, the next waiting case
+is launched.
+
+The default dataset is written to:
 
 ```text
 data/synthetic_bmm.nc
 ```
 
-Failed BMM cases retain their diagnostic namelist/log/output files under a
-sibling `*_failures` directory.
-
-To use a different dataset filename:
+To use another filename:
 
 ```bash
-make generate BMM_DATASET=data/pilot_001.nc
+make generate BMM_DATASET=data/pilot_002.nc
 ```
 
-## Analyse the dataset
+Failed-case diagnostics are retained in a sibling `*_failures` directory.
+
+## 4. Check the dataset
+
+Always inspect a newly generated ensemble before training:
 
 ```bash
 make analyse
 ```
 
-or for another dataset:
+or:
 
 ```bash
-make analyse BMM_DATASET=data/pilot_001.nc
+make analyse BMM_DATASET=data/pilot_002.nc
 ```
 
-## Train the surrogate
+This reports the sampled thermodynamic/aerosol ranges and key BMM outputs.
 
-The current default is the v3 profile surrogate:
+## 5. Train a surrogate
+
+### NVIDIA GPU
+
+On the PowerEdge, after `make gpu-setup`, the normal command is simply:
 
 ```bash
 make train
 ```
 
-To change the training length:
+The default `DEVICE=auto` uses a functional NVIDIA/CUDA backend when one is
+available and otherwise falls back to CPU.
+
+To change the number of epochs:
 
 ```bash
-make train PROFILE_EPOCHS=250
+make train DEVICE=gpu PROFILE_EPOCHS=250
 ```
 
-Generated model weights are written to:
+The training script verifies that CUDA is functional and reports the selected
+GPU at startup. The trained parameters are moved back to CPU before evaluation
+and saving, so the resulting checkpoint is portable.
+
+### CPU
+
+To force CPU training, use:
+
+```bash
+make train DEVICE=cpu
+```
+
+### Current GPU implementation
+
+GPU execution is supported for the current **profile surrogate**. The model is
+still evaluated trajectory-by-trajectory internally, so GPU support should be
+viewed as the first deployment step rather than the final performance design.
+A later optimisation can batch many trajectories/grid points into larger GPU
+operations without changing the user-facing `make train DEVICE=gpu` workflow.
+
+The default model checkpoint is written under:
 
 ```text
 models/profile_surrogate.bson
 ```
 
-The train/validation/test split CSV is written under `results/`.
+and the deterministic train/validation/test split is written under `results/`.
 
-The NeuralODE experiment remains available explicitly:
+## 6. Evaluate held-out BMM cases
 
-```bash
-make train-neuralode
-```
-
-but the profile surrogate is the current baseline.
-
-## Evaluate held-out cases
+After training:
 
 ```bash
 make compare
 ```
 
-This reads the trained profile model from `models/` and writes metrics and
-figures under:
+This reports held-out metrics and writes diagnostic plots/tables under:
 
 ```text
 results/surrogate_comparison/
 ```
 
-## Current physical formulation
+## Repository layout
 
-Synthetic cases contain one to four external lognormal aerosol modes. Each
-mode contains number mixing ratio, dry median diameter, log-width and
-hygroscopicity/composition information.
+```text
+julia-parcel-model/
+├── README.md              this guide
+├── Makefile               user-facing workflow
+├── .gitignore
+├── bmm/                   separate BMM git subtree
+├── julia/                 Julia source + Project.toml/Manifest.toml
+├── configs/               example parent-project configuration
+├── scripts/               repository/subtree helper scripts
+├── docs/                  development notes (not extra READMEs)
+├── data/                  generated datasets (gitignored)
+├── models/                trained checkpoints (gitignored)
+├── results/               metrics and plots (gitignored)
+└── scratch/               temporary local work (gitignored)
+```
 
-The current v3 surrogate predicts:
+There is only one parent-project `README.md`, here at the repository root.
+Documentation that belongs to the independently maintained BMM subtree remains
+part of that subtree.
 
-- liquid-water mixing ratio `ql`;
-- bounded total activated fraction;
-- extinction coefficient `beta_ext`.
+There is also only one Julia environment for the parent project:
 
-Supersaturation is diagnosed from conserved total water rather than predicted
-independently:
+```text
+julia/Project.toml
+julia/Manifest.toml
+```
+
+## The model is expected to evolve
+
+The **workflow and physical interface** are intended to be stable; the neural
+network architecture is not.
+
+At present the profile surrogate is the working research baseline. It uses a
+permutation-invariant modal aerosol encoder and predicts liquid water,
+activation and extinction-related quantities while diagnosing supersaturation
+from total-water conservation.
+
+That implementation will change as the parameterisation improves. Likely
+future work includes mode-resolved activation, larger BMM training ensembles,
+a local host-model timestep interface, stronger batching/vectorisation and
+possibly different Flux/Lux/SciML architectures.
+
+For that reason, scripts should use the public workflow (`make train`,
+`make compare`) rather than depending unnecessarily on a particular internal
+network layout or a version number such as "v3".
+
+## Physical principle retained by the current surrogate
+
+The current model does not independently predict supersaturation. Total water
+is used to diagnose it:
 
 ```text
 qtot = ql + (1 + S) qvs(T,P)
+S    = (qtot - ql) / qvs(T,P) - 1
 ```
 
-so:
+This is an example of the intended design philosophy: keep known physics and
+hard constraints explicit, and use the learned component for the unresolved
+microphysics.
 
-```text
-S = (qtot - ql) / qvs(T,P) - 1
+## Useful Make variables
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `CASES` | `256` | Number of synthetic BMM trajectories |
+| `WORKERS` | `64` | Maximum concurrent BMM processes |
+| `MAX_MODES` | `4` | Maximum aerosol modes per case |
+| `SURROGATE_SEED` | `20260831` | Sampling and train/test split seed |
+| `PROFILE_EPOCHS` | `150` | Profile-model training epochs |
+| `DEVICE` | `auto` | `auto`, `cpu` or `gpu` for training |
+| `BMM_DATASET` | `data/synthetic_bmm.nc` | Dataset path from repository root |
+| `NPLOTS` | `8` | Number of selected comparison plots |
+
+Examples:
+
+```bash
+make generate CASES=2000 WORKERS=128
+make train DEVICE=gpu PROFILE_EPOCHS=200
+make compare NPLOTS=12
 ```
-
-This keeps the surrogate thermodynamically constrained.
-
-The next scientific development is expected to add per-original-aerosol-mode
-activation diagnostics to BMM and train a mode-resolved activation head.
-
-## BMM numerical configuration used by the synthetic generator
-
-The current liquid-only training configuration fixes:
-
-```text
-ice_flag        = 0
-bin_scheme_flag = 0
-sce_flag        = 0
-```
-
-The synthetic generator currently samples broad thermodynamic, updraft and
-modal aerosol conditions and runs a 500 m parcel ascent.
-
-BMM aerosol number input is number mixing ratio per kg dry air. The synthetic
-sampler defines intuitive concentrations in cm^-3 and converts them using the
-dry-air density convention used by the project.
-
-## Updating the BMM subtree
-
-Because `bmm/` belongs to a separate repository, update it using the existing
-subtree workflow rather than manually reorganising files inside it. See:
-
-```text
-scripts/bmm-subtree.sh
-```
-
-Changes intended for BMM itself should normally be made in the BMM repository
-and then brought into this project as a subtree update.
 
 ## Direct Julia commands
 
-The top-level Makefile is preferred, but scripts can still be run directly:
+The top-level Makefile is preferred, but the equivalent commands can be useful
+for debugging:
 
 ```bash
 cd julia
@@ -329,26 +318,21 @@ BMM_EXE=../bmm/main.exe BMM_WORKERS=64 \
 
 julia --project=. analyse_dataset.jl ../data/synthetic_bmm.nc
 
-MODEL_DIR=../models RESULTS_DIR=../results \
+MODEL_DIR=../models RESULTS_DIR=../results DEVICE=gpu \
   julia --project=. train_surrogate.jl \
   ../data/synthetic_bmm.nc profile 150 20260831
 ```
 
-## Useful Make variables
+## Updating the BMM subtree
 
-| Variable | Default | Purpose |
-|---|---:|---|
-| `CASES` | `256` | Number of BMM trajectories |
-| `WORKERS` | `64` | Maximum concurrent BMM processes |
-| `MAX_MODES` | `4` | Maximum aerosol modes per synthetic case |
-| `SURROGATE_SEED` | `20260831` | Sampling and split seed |
-| `PROFILE_EPOCHS` | `150` | Profile-surrogate epochs |
-| `NEURALODE_EPOCHS` | `40` | NeuralODE experiment epochs |
-| `BMM_DATASET` | `data/synthetic_bmm.nc` | Dataset path from repo root |
-| `NPLOTS` | `8` | Number of selected held-out case plots |
-
-For the current command summary:
+Do not manually reorganise `bmm/` from this repository. Update it through the
+git-subtree workflow. If a `bmm-upstream` remote has been configured:
 
 ```bash
-make help
+git status
+git fetch bmm-upstream
+git subtree pull --prefix=bmm bmm-upstream main --squash
 ```
+
+Changes to BMM itself should normally be developed in its own repository and
+then pulled into this project as a subtree update.
