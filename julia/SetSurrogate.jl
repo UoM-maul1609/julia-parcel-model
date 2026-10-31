@@ -271,16 +271,24 @@ end
 
 function _trajectory_loss(pred, truth)
     err = pred .- truth
-    ql_loss   = mean(abs2, view(err, 1, :))
-    fact_loss = mean(abs2, view(err, 2, :))
-    beta_loss = mean(abs2, view(err, 3, :))
+    npt = size(err, 2)
+
+    # Keep reductions GPU-safe: avoid Statistics.mean over 1-D CuArray views,
+    # which falls back to scalar indexing on the host.
+    ql_loss   = sum(abs2, err[1:1, :]) / npt
+    fact_loss = sum(abs2, err[2:2, :]) / npt
+    beta_loss = sum(abs2, err[3:3, :]) / npt
     point = ql_loss + 2.0f0 * fact_loss + beta_loss
-    peak_ql = (maximum(view(pred,1,:)) - maximum(view(truth,1,:)))^2
-    peak_fact = (maximum(view(pred,2,:)) - maximum(view(truth,2,:)))^2
-    peak_beta = (maximum(view(pred,3,:)) - maximum(view(truth,3,:)))^2
-    peak = (peak_ql + 2.0f0*peak_fact + peak_beta) / 4f0
-    final = mean(abs2,view(pred,:,size(pred,2)) .- view(truth,:,size(truth,2)))
-    point + 0.15f0*peak + 0.05f0*final
+
+    peak_ql   = (maximum(pred[1:1, :]) - maximum(truth[1:1, :]))^2
+    peak_fact = (maximum(pred[2:2, :]) - maximum(truth[2:2, :]))^2
+    peak_beta = (maximum(pred[3:3, :]) - maximum(truth[3:3, :]))^2
+    peak = (peak_ql + 2.0f0 * peak_fact + peak_beta) / 4f0
+
+    last_err = pred[:, end:end] .- truth[:, end:end]
+    final = sum(abs2, last_err) / length(last_err)
+
+    point + 0.15f0 * peak + 0.05f0 * final
 end
 
 profile_loss(m::ProfileSurrogate, p, c::MLCase; device=identity) =
