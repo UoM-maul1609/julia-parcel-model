@@ -36,6 +36,16 @@
 		integer(i4b), parameter :: BIN_MOVING_CENTRE = 1_i4b
 		integer(i4b), parameter :: BIN_CHEN_LAMB     = 2_i4b
 
+        ! Full-moving insertion policy for aerosol residuals released by complete
+        ! evaporation/sublimation. SAME_INDEX is the default; PARTITION inserts
+        ! by the current water-mass pivots.
+        integer(i4b), parameter :: FULL_MOVING_RELEASE_SAME_INDEX = 0_i4b
+        integer(i4b), parameter :: FULL_MOVING_RELEASE_PARTITION  = 1_i4b
+
+        ! Fixed-grid initialisation used by moving-centre and Chen-Lamb.
+        integer(i4b), parameter :: FIXED_GRID_LEGACY = 0_i4b
+        integer(i4b), parameter :: FIXED_GRID_HYBRID = 1_i4b
+
         ! Conserved-moment semantics used by the collection solver.
         integer(i4b), parameter :: MOMENT_EXTENSIVE = 1_i4b
         integer(i4b), parameter :: MOMENT_NUMBER    = 2_i4b
@@ -68,7 +78,7 @@
             ! variables for bin model
             integer(i4b) :: n_bins1,n_modes,n_comps, n_bin_mode, n_bin_modew, n_bin_mode1, &
                             n_sound, n_chamber, ice_flag, sce_flag,bin_scheme_flag, &
-                            n_inp_classes, iinp_start, idemott
+                            n_inp_classes, iinp_start, idemott, iaer05
             real(wp) :: dt
 			! Cumulative hydrometeor mass removed by fallout
 			! kg hydrometeor / kg dry air
@@ -91,6 +101,22 @@
             ! positive airborne hydrometeor/particle losses.
             real(wp) :: qchamber_bl=0._wp, qchamber_bl_step=0._wp, &
                         qchamber_bl_evap=0._wp, qchamber_bl_evap_step=0._wp
+            ! Physical wet/icy-wall diagnostics.  Each cumulative source/sink is
+            ! stored as a positive magnitude; qchamber_bl remains the signed-net
+            ! convention used historically, with positive values denoting net
+            ! airborne-water loss to the wall and negative values net wall source.
+            real(wp) :: qchamber_wall_liq_evap=0._wp, qchamber_wall_liq_cond=0._wp, &
+                        qchamber_wall_ice_subl=0._wp, qchamber_wall_ice_dep=0._wp
+            ! Prognostic wall-water reservoirs are physical chamber masses [kg],
+            ! not mixing ratios.  This keeps the stored wall amount independent
+            ! of changes in prescribed chamber pressure/dry-air mass.
+            real(wp) :: chamber_wall_liquid_water=0._wp, &
+                        chamber_wall_ice_water=0._wp
+            ! Instantaneous wall-vapour diagnostics.  RHwall is dimensionless.
+            ! The signed area-mean vapour flux is positive for wall -> air and
+            ! negative for air -> wall.
+            real(wp) :: chamber_wall_rh=0._wp, &
+                        chamber_wall_vapour_flux=0._wp
             real(wp) :: qfan_liq=0._wp, qfan_ice=0._wp
             real(wp) :: nfan_liq=0._wp, nfan_ice=0._wp
             real(wp) :: qwall_liq=0._wp, qwall_ice=0._wp
@@ -194,17 +220,26 @@
 		real(wp) :: residence_depth=100._wp        
         real(wp) :: zinit,tpert,winit,winit2, amplitude2, tau2, &
                     tinit,pinit,rhinit,radinit,z_ctop=-1._wp, alpha_therm, alpha_cond, &
-                    alpha_therm_ice, alpha_dep, thresh_to_start_hom_mix
+                    alpha_therm_ice, alpha_dep, thresh_to_start_hom_mix=0._wp
 
         ! Chamber forcing/options.  The measured time series remain in
         ! &chamber_spec; these switches say how they are used.
         logical :: chamber_force_pressure=.false., &
                    chamber_force_temperature=.false., &
                    chamber_force_qtot=.false.
-        integer(i4b) :: chamber_bl_mix=0_i4b, chamber_bl_evap_mode=3_i4b, &
+        integer(i4b) :: chamber_bl_mix=0_i4b, chamber_bl_evap_mode=2_i4b, &
+                        chamber_bl_wall_water_mode=0_i4b, &
                         chamber_fan_loss=0_i4b, chamber_wall_loss=0_i4b
         real(wp) :: chamber_bl_tau=60._wp, chamber_bl_alpha_t=1._wp, &
                     chamber_bl_temp_offset=0._wp, &
+                    chamber_bl_evap_size_exp=2._wp, &
+                    chamber_bl_inhom_size_exp=-1._wp, &
+                    chamber_wall_liquid_fraction=0._wp, &
+                    chamber_wall_ice_fraction=0._wp, &
+                    chamber_wall_water_efficiency=1._wp, &
+                    chamber_wall_vapour_transfer_velocity=1.e-3_wp, &
+                    chamber_wall_liquid_water_init=0._wp, &
+                    chamber_wall_ice_water_init=0._wp, &
                     chamber_fan_loss_kmax=0._wp, chamber_fan_loss_d50_ref=4.e-6_wp, &
                     chamber_fan_loss_exp=6._wp, chamber_fan_rpm=25000._wp, &
                     chamber_fan_rpm_ref=25000._wp, &
@@ -217,13 +252,15 @@
         logical :: chamber_forcing_active=.false.
 
         integer(i4b) :: microphysics_flag=0, kappa_flag,updraft_type, vent_flag, &
-                        sce_flag=0,ice_flag=0, bin_scheme_flag=1, entrain_period=0
+                        sce_flag=0,ice_flag=0, bin_scheme_flag=1, entrain_period=0, &
+                        full_moving_release_mode=FULL_MOVING_RELEASE_SAME_INDEX, &
+                        inas_wetting_mode=0_i4b
         logical :: use_prof_for_tprh, hm_flag, mode1_flag, mode2_flag, &
         	bubble_flag, release_aerosol, entrain_aerosol
         integer(i4b) :: break_flag
         logical, dimension(N_INUC_MECH) :: ice_nucleation_mech = &
             [.true.,.false.,.true.,.false.]
-        real(wp) :: dz,dt, runtime, t_thresh
+        real(wp) :: dz,dt, runtime, t_thresh, inas_xthresh=0.01_wp
         ! sounding spec
         real(wp) :: psurf, tsurf
         integer(i4b), parameter :: nlevels_r=1000
@@ -236,7 +273,7 @@
         	wall_temp_chamber, qtot_chamber
         ! aerosol setup
         integer(i4b) :: n_intern, n_mode,n_sv,sv_flag,n_bins,n_comps, &
-                        n_inp_classes=0_i4b
+                        n_inp_classes=0_i4b, fixed_grid_mode=FIXED_GRID_HYBRID
         ! aerosol_spec
         real(wp), allocatable, dimension(:,:) :: n_aer1,d_aer1,sig_aer1, mass_frac_aer1
         real(wp), allocatable, dimension(:) ::  molw_core1,density_core1,nu_core1, &
@@ -427,6 +464,11 @@
                     chamber_force_pressure, chamber_force_temperature, chamber_force_qtot, &
                     chamber_bl_mix, chamber_bl_tau, chamber_bl_evap_mode, &
                     chamber_bl_alpha_t, chamber_bl_temp_offset, &
+                    chamber_bl_evap_size_exp, chamber_bl_inhom_size_exp, &
+                    chamber_bl_wall_water_mode, chamber_wall_liquid_fraction, &
+                    chamber_wall_ice_fraction, chamber_wall_water_efficiency, &
+                    chamber_wall_vapour_transfer_velocity, &
+                    chamber_wall_liquid_water_init, chamber_wall_ice_water_init, &
                     chamber_fan_loss, chamber_fan_loss_kmax, chamber_fan_loss_d50_ref, &
                     chamber_fan_loss_exp, chamber_fan_rpm, chamber_fan_rpm_ref, &
                     chamber_wall_loss, chamber_wall_ustar, chamber_diameter, chamber_height
@@ -434,13 +476,13 @@
         namelist /run_vars/ outputfile, scefile,runtime, dt, &
                     zinit,tpert,use_prof_for_tprh,winit,winit2,amplitude2, &
                     tinit,pinit,rhinit, radinit, bubble_flag, &
-                    microphysics_flag, ice_flag, bin_scheme_flag, sce_flag, &
-                    ice_nucleation_mech, &
+                    microphysics_flag, ice_flag, bin_scheme_flag, sce_flag, fixed_grid_mode, &
+                    ice_nucleation_mech, inas_wetting_mode, inas_xthresh, &
                     hm_flag, break_flag, mode1_flag, mode2_flag, &
                     use_adt_optics, optics_wavelength, vent_flag, &
                     kappa_flag, updraft_type,t_thresh, adiabatic_prof, &
                     entrain_period, thresh_to_start_hom_mix, release_aerosol, &
-                    entrain_aerosol, vert_ent, &
+                    full_moving_release_mode, entrain_aerosol, vert_ent, &
                     z_ctop, ent_rate,n_levels_s, &
                     fallout_flag,residence_depth, &
                     alpha_therm,alpha_cond,alpha_therm_ice,alpha_dep
@@ -463,8 +505,16 @@
         ! read in namelists	and allocate arrays								   !
         !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 		open(unit=8,file=nmlfile,status='old',action='read',delim='apostrophe')
+        fixed_grid_mode=FIXED_GRID_HYBRID
         rewind(8)
         read(8,nml=run_vars)
+
+        if (inas_wetting_mode.ne.0_i4b .and. inas_wetting_mode.ne.1_i4b) then
+            error stop 'inas_wetting_mode must be 0 (activated) or 1 (X >= Xthresh)'
+        endif
+        if (inas_xthresh.lt.0._wp) then
+            error stop 'inas_xthresh must be non-negative'
+        endif
 
         ! Reset optional chamber controls on every namelist read so omission of
         ! &chamber_options is guaranteed to mean no chamber-specific forcing or
@@ -476,8 +526,17 @@
         chamber_bl_mix=0_i4b
         chamber_bl_tau=60._wp
         chamber_bl_alpha_t=1._wp
-        chamber_bl_evap_mode=3_i4b
+        chamber_bl_evap_mode=2_i4b
         chamber_bl_temp_offset=0._wp
+        chamber_bl_evap_size_exp=2._wp
+        chamber_bl_inhom_size_exp=-1._wp
+        chamber_bl_wall_water_mode=0_i4b
+        chamber_wall_liquid_fraction=0._wp
+        chamber_wall_ice_fraction=0._wp
+        chamber_wall_water_efficiency=1._wp
+        chamber_wall_vapour_transfer_velocity=1.e-3_wp
+        chamber_wall_liquid_water_init=0._wp
+        chamber_wall_ice_water_init=0._wp
         chamber_fan_loss=0_i4b
         chamber_fan_loss_kmax=0._wp
         chamber_fan_loss_d50_ref=4.e-6_wp
@@ -500,6 +559,10 @@
         chamber_forcing_active=chamber_force_pressure .or. chamber_force_temperature .or. &
                          chamber_force_qtot
 
+        if (full_moving_release_mode.lt.FULL_MOVING_RELEASE_SAME_INDEX .or. &
+            full_moving_release_mode.gt.FULL_MOVING_RELEASE_PARTITION) error stop &
+            'full_moving_release_mode must be 0 (same source index) or 1 (water-mass partition)'
+
         if (vert_ent) error stop &
             'vert_ent/Sanchez cloud-top entrainment has been removed; use lateral entrainment'
         if (n_levels_c.lt.0) error stop 'n_levels_c must be non-negative'
@@ -509,13 +572,41 @@
             'chamber_bl_mix must be 0 (off) or 1 (coupled wall-BL processing)'
         if (chamber_bl_mix.eq.1 .and. chamber_bl_tau.le.0._wp) error stop &
             'chamber_bl_tau must be > 0 when chamber_bl_mix is enabled'
-        if (chamber_bl_alpha_t.lt.0._wp) error stop &
-            'chamber_bl_alpha_t must be >= 0'
-        if (chamber_bl_evap_mode.lt.1 .or. chamber_bl_evap_mode.gt.3) error stop &
-            'chamber_bl_evap_mode must be 1 (homogeneous D2), 2 (uniform extreme), or 3 (D2-weighted extreme)'
-        if (chamber_bl_mix.eq.1 .and. chamber_bl_alpha_t.gt.0._wp .and. &
+        if (chamber_bl_alpha_t.lt.0._wp .or. chamber_bl_alpha_t.gt.1._wp) &
+            error stop 'chamber_bl_alpha_t must be between 0 and 1'
+        if (chamber_bl_evap_mode.lt.1 .or. chamber_bl_evap_mode.gt.2) error stop &
+            'chamber_bl_evap_mode must be 1 (homogeneous D2) or 2 (extreme inhomogeneous)'
+        ! Deprecated compatibility alias.  Old namelists may still contain
+        ! chamber_bl_inhom_size_exp.  A non-negative value overrides the new
+        ! general evaporation exponent; new namelists should set only
+        ! chamber_bl_evap_size_exp and leave the alias at its default -1.
+        if (chamber_bl_inhom_size_exp.ge.0._wp) &
+            chamber_bl_evap_size_exp=chamber_bl_inhom_size_exp
+        if (chamber_bl_evap_size_exp.lt.0._wp) error stop &
+            'chamber_bl_evap_size_exp must be >= 0'
+        if (chamber_bl_wall_water_mode.lt.0 .or. chamber_bl_wall_water_mode.gt.2) error stop &
+            'chamber_bl_wall_water_mode must be 0 (legacy), 1 (reservoir relaxation), or 2 (physical mass transfer)'
+        if (chamber_wall_liquid_fraction.lt.0._wp .or. chamber_wall_liquid_fraction.gt.1._wp) &
+            error stop 'chamber_wall_liquid_fraction must be between 0 and 1'
+        if (chamber_wall_ice_fraction.lt.0._wp .or. chamber_wall_ice_fraction.gt.1._wp) &
+            error stop 'chamber_wall_ice_fraction must be between 0 and 1'
+        if (chamber_wall_water_efficiency.lt.0._wp .or. chamber_wall_water_efficiency.gt.1._wp) &
+            error stop 'chamber_wall_water_efficiency must be between 0 and 1'
+        if (chamber_wall_vapour_transfer_velocity.lt.0._wp) error stop &
+            'chamber_wall_vapour_transfer_velocity must be >= 0 m s-1'
+        if (chamber_wall_liquid_water_init.lt.0._wp .or. chamber_wall_ice_water_init.lt.0._wp) &
+            error stop 'Initial chamber wall-water reservoirs must be non-negative kg'
+        if (chamber_bl_wall_water_mode.ge.1 .and. &
+            (chamber_diameter.le.0._wp .or. chamber_height.le.0._wp)) error stop &
+            'Wall-water reservoir modes require positive chamber_diameter and chamber_height'
+        if (chamber_bl_wall_water_mode.ge.1 .and. &
+            (chamber_wall_liquid_fraction.gt.0._wp .or. chamber_wall_ice_fraction.gt.0._wp)) then
+            write(*,*) 'WARNING: chamber_wall_liquid_fraction/chamber_wall_ice_fraction are ignored in reservoir wall-water mode'
+        endif
+        if (chamber_bl_mix.eq.1 .and. &
+            (chamber_bl_alpha_t.gt.0._wp .or. chamber_bl_wall_water_mode.ge.1) .and. &
             n_levels_c.lt.2) error stop &
-            'Coupled chamber BL with chamber_bl_alpha_t > 0 requires wall_temp_chamber data'
+            'Coupled chamber BL thermal/wall-water processing requires wall_temp_chamber data'
         if (chamber_fan_loss.lt.0 .or. chamber_fan_loss.gt.1) error stop &
             'chamber_fan_loss must be 0 (off) or 1 (sigmoid inertial collection)'
         if (chamber_fan_loss.eq.1) then
@@ -564,6 +655,9 @@
             n_comps.lt.1) error stop 'Aerosol dimensions must be positive'
         if (dmina.le.0._wp .or. dmaxa.le.dmina) error stop &
             'Require 0 < dmina < dmaxa'
+        if (fixed_grid_mode.ne.FIXED_GRID_LEGACY .and. &
+            fixed_grid_mode.ne.FIXED_GRID_HYBRID) error stop &
+            'fixed_grid_mode must be 0 (legacy) or 1 (hybrid equal-number + geometric)'
         if (any(n_aer1.lt.0._wp)) error stop &
             'Aerosol number concentrations must be non-negative'
         do j=1,n_mode
@@ -640,9 +734,10 @@
         if(n_levels_c.gt.0) then
             rewind(8)
             read(8,nml=chamber_spec)
-            if (chamber_bl_mix.eq.1 .and. chamber_bl_alpha_t.gt.0._wp) then
+            if (chamber_bl_mix.eq.1 .and. &
+                (chamber_bl_alpha_t.gt.0._wp .or. chamber_bl_wall_water_mode.ge.1)) then
                 if (any(wall_temp_chamber.lt.150._wp) .or. any(wall_temp_chamber.gt.400._wp)) &
-                    error stop 'Wall-coupled BL temperature mode requires valid wall_temp_chamber values [K]'
+                    error stop 'Wall-coupled BL processing requires valid wall_temp_chamber values [K]'
             endif
         endif
         if(chamber_force_pressure .or. chamber_force_temperature) then
@@ -720,7 +815,7 @@
             ! ns = exp(-0.517 Tc + 8.934), valid here over -12 to -36 C.
             if (tc.gt.-12._wp) return
             teval=max(tc,-36._wp)
-            ns_site=exp(-0.517_wp*teval+8.934_wp)
+            ns_site=exp(-0.517_wp*teval+8.934_wp)*5._wp
 
         case(INP_ATD03)
             ! Arizona Test Dust (ATD03), AIDAd dust category.
@@ -825,13 +920,13 @@
     ! ============================================================================
     ! particle_is_activated
     ! ============================================================================
-    !>Return true when a warm BMM particle lies beyond the maximum of its
-    !>current Koehler/FHH equilibrium curve.  For full-moving bins this is
-    !>also the ndrop diagnostic criterion.  Fixed-bin schemes use the same
-    !>critical water mass but fractionally count a bin when that threshold
-    !>lies between its fixed water-mass edges.  For a fixed dry
-    !>composition this is equivalent to wet diameter being greater than the
-    !>critical wet diameter.
+    !>Return true when a warm BMM point-representative particle lies beyond
+    !>the maximum of its current Koehler/FHH equilibrium curve.  This is the
+    !>ndrop criterion for the full-moving and moving-centre schemes.  The
+    !>Chen-Lamb fixed-bin scheme uses the same critical water mass but
+    !>integrates its reconstructed within-bin number distribution above that
+    !>threshold.  For a fixed dry composition this is equivalent to wet
+    !>diameter being greater than the critical wet diameter.
     !>
     !>The minimisation helper functions use the module scratch variables
     !>n_sel, rh_act and mult, and historically read parcel1%t.  Save/restore
@@ -897,6 +992,54 @@
     end function particle_is_activated
 
 
+    ! ============================================================================
+    ! particle_is_inas_eligible
+    ! ============================================================================
+    !>Return true if a warm particle satisfies the configured liquid-water
+    !>eligibility criterion for explicit IASD/INAS immersion freezing.
+    !>
+    !>inas_wetting_mode = 0 (default): require Koehler/FHH activation.  This
+    !>preserves the historical BMM behaviour.
+    !>
+    !>inas_wetting_mode = 1: require
+    !>
+    !>    X = Vwater/Vdry = (mwater/rho_water) / sum_j(maerosol,j/rho_j)
+    !>
+    !>to satisfy X >= inas_xthresh.  inas_xthresh is a dimensionless tuning
+    !>parameter (default 0.01), not a universal physical wetting threshold.
+    logical function particle_is_inas_eligible(ibin,mwat_current,t_current, &
+                                                mcomp,rhocomp) result(eligible)
+        implicit none
+        integer(i4b), intent(in) :: ibin
+        real(wp), intent(in) :: mwat_current,t_current
+        real(wp), dimension(:), intent(in) :: mcomp,rhocomp
+        integer(i4b) :: j
+        real(wp) :: vdry,xwater
+
+        eligible=.false.
+        if (mwat_current.le.tiny(1._wp)) return
+
+        select case(inas_wetting_mode)
+        case(0)
+            eligible=particle_is_activated(ibin,mwat_current,t_current)
+
+        case(1)
+            vdry=0._wp
+            do j=1,min(size(mcomp),size(rhocomp))
+                if (mcomp(j).le.0._wp .or. rhocomp(j).le.0._wp) cycle
+                vdry=vdry+mcomp(j)/rhocomp(j)
+            enddo
+            if (vdry.le.tiny(1._wp)) return
+
+            xwater=(mwat_current/rhow)/vdry
+            eligible=xwater.ge.inas_xthresh
+
+        case default
+            error stop 'Unknown inas_wetting_mode in particle_is_inas_eligible'
+        end select
+    end function particle_is_inas_eligible
+
+
 
 	! ============================================================================
 	! initialise_bmm_arrays
@@ -927,6 +1070,8 @@
 	!>densities, van't Hoff factors and kappa values
 	!>@param[in] org_content1,molw_org1,kappa_org1,density_org1,delta_h_vap1,nu_org1,log_c_star1:
 	!>semivolatile-organic properties
+	!>@param[in] n_bins_init: number of initially populated equal-number aerosol bins per mode;
+    !>may be smaller than total n_bins when a hybrid fixed grid appends empty cloud bins
 	!>@param[in] sce_flag: stochastic-collection-equation switch
     subroutine initialise_bmm_arrays(psurf, tsurf, q_read, theta_read, rh_read, z_read, &
     				time_chamber, press_chamber, temp_chamber, qtot_chamber, &
@@ -937,7 +1082,7 @@
                     kappa_flag, updraft_type, adiabatic_prof, vert_ent, z_ctop, &
                     ent_rate, n_levels_s, n_levels_c, &
                     alpha_therm, alpha_cond, alpha_therm_ice, &
-                    alpha_dep, n_intern, n_mode, n_sv, sv_flag, n_bins, n_comps, &
+                    alpha_dep, n_intern, n_mode, n_sv, sv_flag, n_bins, n_bins_init, n_comps, &
                     n_aer1,d_aer1,sig_aer1,dmina,dmaxa,mass_frac_aer1,molw_core1, &
                     density_core1, nu_core1, kappa_core1, org_content1, molw_org1, &
                     kappa_org1, density_org1, delta_h_vap1,nu_org1, log_c_star1, &
@@ -950,7 +1095,7 @@
     integer(i4b), intent(in) :: microphysics_flag, ice_flag, bin_scheme_flag, vent_flag, &
                     kappa_flag, updraft_type, n_levels_s,n_levels_c, &
                     n_intern, n_mode, n_sv, &
-                    sv_flag, n_bins, n_comps, sce_flag
+                    sv_flag, n_bins, n_bins_init, n_comps, sce_flag
     real(wp), intent(in) :: psurf, radinit, &
                     tsurf, runtime, dt, zinit, tpert, winit, tinit, &
                     pinit, rhinit, alpha_therm, alpha_cond, alpha_therm_ice, &
@@ -972,20 +1117,25 @@
     real(wp) :: num, ntot, number_per_bin, test, var1, &
                 eps2, z1, z2, htry, hmin, var, dummy
     real(wp), dimension(1) :: p1, z11
-    real(wp) :: p11, p22, rm, cpm
+    real(wp) :: p11, p22, rm, cpm, dlo_init, dhi_init, frac05_init
     integer(i4b) :: i,j,k, AllocateStatus, iloc
+    logical :: has_inas_init,has_demott_init,has_daily_init
 
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     ! set variables and allocate arrays in parcel                                  !
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    if (n_bins_init.lt.1 .or. n_bins_init.gt.n_bins) error stop &
+        'initialise_bmm_arrays: require 1 <= n_bins_init <= n_bins'
+
     parcel1%n_sound=n_levels_s   
     parcel1%n_chamber=n_levels_c
-    parcel1%n_bins1=n_bins    
+    parcel1%n_bins1=n_bins
     parcel1%n_modes=n_mode
     parcel1%n_comps=n_comps
     parcel1%n_inp_classes=n_inp_classes
     parcel1%iinp_start=n_comps+6
     parcel1%idemott=parcel1%iinp_start+n_inp_classes
+    parcel1%iaer05=parcel1%idemott+1
     parcel1%n_bin_modew=n_bins*n_mode
     parcel1%n_bin_mode1=(n_bins+1)*n_mode
     parcel1%z=zinit
@@ -1009,6 +1159,14 @@
 	parcel1%qchamber_bl=0._wp
 	parcel1%qchamber_bl_step=0._wp
 	parcel1%qchamber_bl_evap_step=0._wp
+    parcel1%qchamber_wall_liq_evap=0._wp
+    parcel1%qchamber_wall_liq_cond=0._wp
+    parcel1%qchamber_wall_ice_subl=0._wp
+    parcel1%qchamber_wall_ice_dep=0._wp
+    parcel1%chamber_wall_liquid_water=chamber_wall_liquid_water_init
+    parcel1%chamber_wall_ice_water=chamber_wall_ice_water_init
+    parcel1%chamber_wall_rh=0._wp
+    parcel1%chamber_wall_vapour_flux=0._wp
 	parcel1%qfan_liq=0._wp
 	parcel1%qfan_ice=0._wp
 	parcel1%nfan_liq=0._wp
@@ -1022,7 +1180,7 @@
     parcel1%ice_flag=ice_flag
     parcel1%n_bin_mode=&
         parcel1%n_bins1*n_mode*(1+parcel1%ice_flag)     ! for all the liquid and ice    
-    parcel1%imoms=ice_flag*(6+n_inp_classes)            ! phi, nmon, vol, rim, unf, cumulative Nin, n_demott
+    parcel1%imoms=ice_flag*(7+n_inp_classes)            ! phi, nmon, vol, rim, unf, cumulative Nin, n_demott, n_aer05
     
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     ! validate bin_scheme_flag					                                   !
@@ -1096,6 +1254,28 @@
     allocate( parcel1%nre(1:parcel1%n_bin_mode), STAT = AllocateStatus)
     if (AllocateStatus /= 0) STOP "*** Not enough memory ***"	
 
+    ! Explicitly initialise particle arrays.  This matters for the hybrid
+    ! fixed grid, where only the first n_bins_init bins contain aerosol at t=0
+    ! and the appended cloud bins are intentionally empty.
+    parcel1%d=0._wp
+    parcel1%mbinedges=0._wp
+    parcel1%maer=0._wp
+    parcel1%npart=0._wp
+    parcel1%npartall=0._wp
+    parcel1%mbin=0._wp
+    parcel1%mbinall=0._wp
+    parcel1%momtemp=0._wp
+    parcel1%moments=0._wp
+    parcel1%rhobin=0._wp
+    parcel1%nubin=0._wp
+    parcel1%molwbin=0._wp
+    parcel1%kappabin=0._wp
+    parcel1%rh_eq=0._wp
+    parcel1%rhoat=0._wp
+    parcel1%dw=0._wp
+    parcel1%da_dt=0._wp
+    parcel1%ndrop=0._wp
+
     allocate( parcel1%q_sound(1:parcel1%n_sound,1:nq), STAT = AllocateStatus)
     if (AllocateStatus /= 0) STOP "*** Not enough memory ***"	
     allocate( parcel1%z_sound(1:parcel1%n_sound), STAT = AllocateStatus)
@@ -1156,18 +1336,22 @@
         !print *,num
         ! set up variables for parcel model
         ntot=num
-        number_per_bin=ntot/real(n_bins,wp)
+        number_per_bin=ntot/real(n_bins_init,wp)
 !         ! make sure it is zero if needed
 !         parcel1%npart(1+(k-1)*n_bins:(k)*n_bins)=min(number_per_bin, &
 !         		sum(n_aer1(:,k))/real(n_bins,wp))
+        ! Keep one dry-diameter edge array per total BMM bin.  Only the
+        ! first n_bins_init+1 entries are aerosol quantile boundaries; the
+        ! appended fixed-grid cloud bins have no dry-aerosol edge meaning.
+        parcel1%d(1+(k-1)*(n_bins+1):k*(n_bins+1))=dmaxa
         parcel1%d(1+(k-1)*(n_bins+1))=dmina
-        do i=1,n_bins
+        do i=1,n_bins_init
             d_dummy=parcel1%d(i+(k-1)*(n_bins+1))
             n_dummy=number_per_bin*(1._wp-1.e-5_wp)
             parcel1%d(i+1+(k-1)*(n_bins+1))= zeroin(&
                         d_dummy*0.9_wp,dmaxa*2._wp,find_upper_diameter, 1.e-30_wp)
         enddo
-        parcel1%d((k)*(n_bins+1))=dmaxa ! nail it to end point - round off
+        parcel1%d((k-1)*(n_bins+1)+n_bins_init+1)=dmaxa ! exact aerosol upper edge
     enddo
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     
@@ -1181,7 +1365,7 @@
     ! mass in the bin. This conserves both aerosol number and dry aerosol mass.     !
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     do k=1,parcel1%n_modes
-        do j=1,parcel1%n_bins1
+        do j=1,n_bins_init
             ! index of diameter edges
             i=j+(k-1)*(n_bins+1)
             ! actual number represented by this bin
@@ -1389,8 +1573,10 @@
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     select case(kappa_flag)
         case(0)
-            do i=1,parcel1%n_bin_modew
-                n_sel=i
+            do j=1,parcel1%n_modes
+                do k=1,n_bins_init
+                    i=k+(j-1)*n_bins
+                    n_sel=i
                 rh_act=0._wp !min(parcel1%rh,0.999_wp)
                 mult=-1._wp
                 ! has to be less than the peak moles of water at activation
@@ -1398,7 +1584,8 @@
                 rh_act=min(parcel1%rh,0.999_wp)
                 mult=1._wp
                 d_dummy=zeroin(1.e-30_wp, test, koehler02,1.e-30_wp)*molw_water 
-                parcel1%mbin(i,n_comps+1)= d_dummy
+                    parcel1%mbin(i,n_comps+1)=d_dummy
+                enddo
             enddo
 !             call koehler01(parcel1%t,parcel1%mbin(:,n_comps+1),&
 !                 parcel1%mbin,parcel1%rhobin,&
@@ -1406,8 +1593,10 @@
 !                 parcel1%rh_eq,parcel1%rhoat,parcel1%dw) 
 !             print *,parcel1%rh_eq
         case(1)
-            do i=1,parcel1%n_bin_modew
-                n_sel=i
+            do j=1,parcel1%n_modes
+                do k=1,n_bins_init
+                    i=k+(j-1)*n_bins
+                    n_sel=i
                 rh_act=0._wp !min(parcel1%rh,0.999_wp)
                 mult=-1._wp
                 ! has to be less than the peak moles of water at activation
@@ -1415,7 +1604,8 @@
                 rh_act=min(parcel1%rh,0.999_wp)
                 mult=1._wp
                 d_dummy=zeroin(1.e-30_wp, test, kkoehler02,1.e-30_wp)*molw_water 
-                parcel1%mbin(i,n_comps+1)= d_dummy
+                    parcel1%mbin(i,n_comps+1)=d_dummy
+                enddo
             enddo
 !             call kkoehler01(parcel1%t,parcel1%mbin(:,n_comps+1),&
 !                 parcel1%mbin,parcel1%rhobin,&
@@ -1563,6 +1753,19 @@
 
 
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    if(ice_flag .ne. 1) then
+        ! Warm-only runs still pass the ice state to routines such as
+        ! mass_balance.  Passing an unallocated array there is not valid
+        ! Fortran (it stops runtime-checked builds), so give the ice number
+        ! and state vectors a valid, zero-filled shape.
+        parcel1%neqice=parcel1%n_bin_modew+4
+        allocate( parcel1%npartice(1:parcel1%n_bin_modew), STAT = AllocateStatus)
+        if (AllocateStatus /= 0) STOP "*** Not enough memory ***"
+        allocate( parcel1%yice(parcel1%neqice), STAT = AllocateStatus)
+        if (AllocateStatus /= 0) STOP "*** Not enough memory ***"
+        parcel1%npartice=0._wp
+        parcel1%yice=0._wp
+    endif
     if(ice_flag .eq. 1) then
         ! allocation:
         allocate( parcel1%dice(1:parcel1%n_bin_mode1), STAT = AllocateStatus)
@@ -1756,6 +1959,55 @@
         ! This is extensive through aggregation and is zero in fresh liquid.
         parcel1%momenttype(parcel1%idemott)=MOMENT_EXTENSIVE
         parcel1%moments(:,parcel1%idemott)=0._wp
+
+        ! Prognostic count of DeMott-eligible dry aerosol cores with Ddry >
+        ! 0.5 micron carried by each hydrometeor population.  It is an
+        ! extensive number moment: collision sums it, freezing transfers it
+        ! to ice, and complete evaporation/sublimation returns it to warm haze.
+        parcel1%momenttype(parcel1%iaer05)=MOMENT_EXTENSIVE
+        parcel1%moments(:,parcel1%iaer05)=0._wp
+        do j=1,parcel1%n_modes
+            do k=1,n_bins_init
+                i=k+(j-1)*n_bins
+                iloc=k+(j-1)*(n_bins+1)
+                call get_inp_control(parcel1%mbin(i,1:n_comps), &
+                    has_inas_init,has_demott_init,has_daily_init)
+                if (.not.has_demott_init) cycle
+                dlo_init=parcel1%d(iloc)
+                dhi_init=parcel1%d(iloc+1)
+                if (dhi_init.le.0.5e-6_wp) then
+                    frac05_init=0._wp
+                elseif (dlo_init.ge.0.5e-6_wp) then
+                    frac05_init=1._wp
+                elseif (dhi_init.gt.dlo_init) then
+                    ! Preserve the existing flat-within-dry-bin DeMott
+                    ! threshold convention when initialising the prognostic.
+                    frac05_init=(dhi_init-0.5e-6_wp)/(dhi_init-dlo_init)
+                else
+                    frac05_init=0._wp
+                endif
+                parcel1%moments(i,parcel1%iaer05)= &
+                    parcel1%npart(i)*max(0._wp,min(frac05_init,1._wp))
+            enddo
+        enddo
+
+    endif
+
+    ! Environmental aerosol is an immutable copy of the initial aerosol
+    ! population.  Initialise it after all intrinsic moments exist so
+    ! entrainment works for every bin scheme, with n_aer05/IN moments included
+    ! automatically when ice microphysics is enabled.
+    if (.not.adiabatic_prof) then
+        parcel1%npart_ent=parcel1%npart
+        parcel1%mbin_ent=parcel1%mbin
+        parcel1%moments_ent=0._wp
+        parcel1%moments_ent(1:parcel1%n_bin_modew,:)= &
+            parcel1%moments(1:parcel1%n_bin_modew,:)
+        parcel1%mbinedges_ent=parcel1%mbinedges
+        parcel1%npart_ent0=parcel1%npart_ent
+        parcel1%mbin_ent0=parcel1%mbin_ent
+        parcel1%moments_ent0=parcel1%moments_ent
+        parcel1%mbinedges_ent0=parcel1%mbinedges_ent
     endif
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -1786,11 +2038,49 @@
 		integer(i4b), dimension(:,:), intent(in) :: indexc	
 		real(wp), dimension(:,:), intent(in) :: mbinedges
 
-		! Copy only fixed-grid information
+		integer(i4b) :: i,imode,ibin
+		real(wp) :: mref,mlow,mhigh
+
+		! Copy the collision receiving-mode map and reference water-mass grid.
 		parcel1%indexc = indexc
 		parcel1%mbinedges = mbinedges
-		! If these are intended to share the same fixed grid:
-		parcel1%mbinedges_ent = mbinedges	
+		if (allocated(parcel1%mbinedges_ent)) then
+			parcel1%mbinedges_ent = mbinedges
+			parcel1%mbinedges_ent0 = mbinedges
+		endif
+
+		! For full-moving + SCE, only the BMM aerosol bins are populated at
+		! initialisation; the appended n_binsc categories have zero number.
+		! Give every empty category a positive reference water-mass coordinate
+		! from the SCE grid.  It remains zero-number, but can subsequently receive
+		! collision products or added/released aerosol.  Occupied full-moving
+		! pivots are never overwritten here.
+		if (parcel1%bin_scheme_flag.eq.BIN_FULL_MOVING) then
+			do imode=1,parcel1%n_modes
+				do ibin=1,parcel1%n_bins1
+					i=(imode-1)*parcel1%n_bins1+ibin
+					if (parcel1%npart(i).gt.tiny(1._wp)) cycle
+					mlow=max(mbinedges(ibin,imode),0._wp)
+					mhigh=max(mbinedges(ibin+1,imode),mlow)
+					if (mlow.gt.0._wp .and. mhigh.gt.0._wp) then
+						mref=sqrt(mlow*mhigh)
+					else
+						mref=0.5_wp*(mlow+mhigh)
+					endif
+					mref=max(mref,tiny(1._wp))
+					parcel1%y(i)=mref
+					parcel1%mbin(i,parcel1%n_comps+1)=mref
+					if (allocated(parcel1%mbin_ent)) &
+						parcel1%mbin_ent(i,parcel1%n_comps+1)=mref
+					if (parcel1%ice_flag.eq.1) then
+						if (parcel1%npartice(i).le.tiny(1._wp)) then
+							parcel1%yice(i)=mref
+							parcel1%mbinice(i,parcel1%n_comps+1)=mref
+						endif
+					endif
+				enddo
+			enddo
+		endif
 	end subroutine write_sce_grid_to_bmm
 	!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -3779,6 +4069,10 @@
           ! nucleation rate
           logj = -906.7_wp + 8502._wp * deltaaw - 26924._wp * deltaaw**2 + 29180._wp * &
                 deltaaw**3
+          ! Cap log10(J) so 10**logj cannot overflow to +Inf (which gives NaN
+          ! when multiplied by the zero water volume of an empty bin).  A rate
+          ! of 1e300 m^-3 s^-1 already freezes any drop within a timestep.
+          logj = min(logj, 300._wp)
 
           koopnucrate = (10._wp**logj) * 1.e6_wp;	! nucleation rate in m^-3 s^-1 
     end function koopnucrate
@@ -4391,21 +4685,23 @@
     logical, dimension(N_INUC_MECH), intent(in) :: ice_nucleation_mech_in
 
     real(wp), dimension(nbinw) :: nw,aw,jw,dn01,dn_inas,dn_daily,dn_demott,dn_koop, &
-                                  nremain,m01,dw,dd,kappa,rhoat
+                                  nremain,m01,dw,dd,kappa,rhoat,aer05_freeze
     real(wp), dimension(nbinw,n_inp_classes) :: nin_freeze
     real(wp), dimension(nmoms) :: momtemp
 
     real(wp), intent(inout), dimension(nbinw) :: yice
     real(wp), intent(inout) :: rh
 
-    integer(i4b) :: i,j,k,kk,im,inew,it,ib,jl,jh,imode,ibin,iedge
-    real(wp) :: fracinliq,naer05,naer_daily,nprimary,nprimary_existing, &
+    integer(i4b) :: i,j,k,kk,im,inew,it,ib,jl,jh
+    real(wp) :: fracinliq,naer05,naer05_basis,naer_daily,nprimary,nprimary_existing, &
                 ndaily_target,ndaily_existing,avail, &
                 n,nt,nb,mt,mb,mnew,nleft,mttot,mbtot,mleft,mall, &
-                dprimary,dn,frac,dcin,tc,dlo,dhi,frac05
+                dprimary,dn,frac,dcin,tc, &
+                aer05_total,aer05_demott,aer05_other,aer05_remaining, &
+                n_before,n_after_demott,other_freeze
     logical :: has_inas,has_demott,has_daily,full_moving
-    logical, dimension(nbinw) :: activated_mask
-    integer(i4b) :: idemott
+    logical, dimension(nbinw) :: activated_mask,inas_eligible_mask
+    integer(i4b) :: idemott,iaer05
 
     ! Non-collisional freezing is only relevant below the melting point.
     if(t.gt.ttr) return
@@ -4417,26 +4713,46 @@
     dn_demott=0._wp
     dn_koop=0._wp
     dn01=0._wp
+    aer05_freeze=0._wp
     nin_freeze=0._wp
     idemott=ncomps+6+n_inp_classes
+    iaer05=idemott+1
     full_moving=(parcel1%bin_scheme_flag.eq.BIN_FULL_MOVING)
 
-    ! Evaluate the expensive Koehler/FHH activation test once per warm bin and
-    ! reuse it for all heterogeneous immersion-nucleation mechanisms.
+    ! Evaluate heterogeneous-immersion eligibility once per warm bin.
+    ! DeMott and Daily/DCMEX retain the historical Koehler/FHH activation
+    ! criterion.  Explicit IASD/INAS either uses that same criterion (mode 0)
+    ! or the relative liquid-water volume X=Vwater/Vdry (mode 1).
     activated_mask=.false.
+    inas_eligible_mask=.false.
     if (ice_nucleation_mech_in(INUC_INAS) .or. &
         ice_nucleation_mech_in(INUC_DEMOTT) .or. &
         ice_nucleation_mech_in(INUC_DAILY)) then
         do i=1,nbinw
             if (npart(i).le.qsmall2 .or. mwat(i).le.tiny(1._wp)) cycle
-            activated_mask(i)=particle_is_activated(i,mwat(i),t)
+
+            if (ice_nucleation_mech_in(INUC_DEMOTT) .or. &
+                ice_nucleation_mech_in(INUC_DAILY) .or. &
+                (ice_nucleation_mech_in(INUC_INAS) .and. inas_wetting_mode.eq.0_i4b)) then
+                activated_mask(i)=particle_is_activated(i,mwat(i),t)
+            endif
+
+            if (ice_nucleation_mech_in(INUC_INAS)) then
+                if (inas_wetting_mode.eq.0_i4b) then
+                    inas_eligible_mask(i)=activated_mask(i)
+                else
+                    inas_eligible_mask(i)=particle_is_inas_eligible( &
+                        i,mwat(i),t,mbin2(i,:),rhobin(i,:))
+                endif
+            endif
         enddo
     endif
 
     ! -------------------------------------------------------------------------
-    ! (1) Immersion freezing by the prognostic discrete INAS spectrum.
-    ! Only activated liquid particles (current water mass above the
-    ! Koehler/FHH critical water mass) are eligible.
+    ! (1) Immersion freezing by the prognostic discrete IASD/INAS spectrum.
+    ! Eligibility is controlled by inas_wetting_mode:
+    !   0 = require Koehler/FHH activation (historical/default);
+    !   1 = require X=Vwater/Vdry >= inas_xthresh.
     !
     ! The IN moments are cumulative and ordered from warm to cold threshold.
     ! When a threshold is crossed, the remaining cumulative value at that
@@ -4449,7 +4765,7 @@
         do i=1,nbinw
             if(npart(i).le.qsmall2) cycle
             if(mwat(i).le.tiny(1._wp)) cycle
-            if(.not.activated_mask(i)) cycle
+            if(.not.inas_eligible_mask(i)) cycle
 
             call get_inp_control(mbin2(i,:),has_inas,has_demott,has_daily)
             if(.not.has_inas) cycle
@@ -4483,90 +4799,43 @@
     ! so aggregation with other ice types does not erase DeMott provenance.
     ! -------------------------------------------------------------------------
     if(ice_nucleation_mech_in(INUC_DEMOTT)) then
-        dd(:)=((sum(mbin2(:,:)/rhobin(:,:),2))*6._wp/pi)**onethird
         naer05=0._wp
 
+        ! n_aer05 is now a prognostic extensive moment rather than a diagnostic
+        ! reconstructed from the current bin index.  It therefore remains valid
+        ! after collision/coalescence, remapping, entrainment and aerosol release.
         do i=1,nbinw
+            if(npart(i).le.qsmall2) cycle
             if(mwat(i).le.tiny(1._wp)) cycle
             if(.not.activated_mask(i)) cycle
             call get_inp_control(mbin2(i,:),has_inas,has_demott,has_daily)
             if((has_inas .and. ice_nucleation_mech_in(INUC_INAS)) .or. .not.has_demott) cycle
-
-			if (full_moving) then
-				! Full-moving bins retain their original dry-aerosol-bin identity.
-				! Integrate a flat number distribution across the original dry bin
-				! when it straddles the DeMott 0.5 micron threshold.
-				imode=(i-1)/nbins1+1
-				ibin=i-(imode-1)*nbins1
-				iedge=ibin+(imode-1)*(nbins1+1)
-			
-				dlo=parcel1%d(iedge)
-				dhi=parcel1%d(iedge+1)
-			
-				if (dhi.le.0.5e-6_wp) then
-					frac05=0._wp
-				elseif (dlo.ge.0.5e-6_wp) then
-					frac05=1._wp
-				elseif (dhi.gt.dlo) then
-					frac05=(dhi-0.5e-6_wp)/(dhi-dlo)
-				else
-					frac05=0._wp
-				endif
-			else
-				! Moving-centre and Chen-Lamb remap particles between numerical bins,
-				! so the original parcel1%d interval is no longer associated with bin i.
-				! Classify using the representative dry-equivalent diameter reconstructed
-				! from the aerosol component masses carried by the remapped population.
-				frac05=merge(1._wp,0._wp,dd(i).gt.0.5e-6_wp)
-			endif
-           naer05=naer05+frac05*max(npart(i)-dn_inas(i),0._wp)
+            naer05=naer05+max(moments(i,iaer05),0._wp)
         enddo
 
-        nprimary=min(naer05,demott_2010(t,naer05))
-
-        ! Existing DeMott primary monomers are tracked explicitly.
+        ! Existing DeMott primary ice remains part of the cumulative DeMott
+        ! target.  Adding it back to the aerosol basis prevents the target from
+        ! spuriously falling solely because earlier DeMott freezing moved an
+        ! eligible aerosol core out of the liquid-drop population.
         nprimary_existing=sum(max(moments(nbinw+1:2*nbinw,idemott),0._wp))
+        naer05_basis=naer05+nprimary_existing
+        nprimary=min(naer05_basis,demott_2010(t,naer05_basis))
         nprimary=max(nprimary-nprimary_existing,0._wp)
 
-        ! Deplete eligible aerosol from the large end, retaining the existing
-        ! BMM ordering used by the DeMott implementation.
+        ! Deplete eligible droplets from the large end, retaining the existing
+        ! BMM ordering.  A drop can freeze at most once, while n_aer05 may exceed
+        ! drop number after coalescence because one drop can carry several
+        ! >0.5-micron aerosol cores.
         do i=nbinw,1,-1
             if(nprimary.le.qsmall2) exit
-            if(mwat(i).le.tiny(1._wp)) cycle
+            if(npart(i).le.qsmall2 .or. mwat(i).le.tiny(1._wp)) cycle
             if(.not.activated_mask(i)) cycle
 
             call get_inp_control(mbin2(i,:),has_inas,has_demott,has_daily)
             if((has_inas .and. ice_nucleation_mech_in(INUC_INAS)) .or. .not.has_demott) cycle
 
-			if (full_moving) then
-				! Full-moving bins retain their original dry-aerosol-bin identity.
-				! Integrate a flat number distribution across the original dry bin
-				! when it straddles the DeMott 0.5 micron threshold.
-				imode=(i-1)/nbins1+1
-				ibin=i-(imode-1)*nbins1
-				iedge=ibin+(imode-1)*(nbins1+1)
-			
-				dlo=parcel1%d(iedge)
-				dhi=parcel1%d(iedge+1)
-			
-				if (dhi.le.0.5e-6_wp) then
-					frac05=0._wp
-				elseif (dlo.ge.0.5e-6_wp) then
-					frac05=1._wp
-				elseif (dhi.gt.dlo) then
-					frac05=(dhi-0.5e-6_wp)/(dhi-dlo)
-				else
-					frac05=0._wp
-				endif
-			else
-				! Moving-centre and Chen-Lamb remap particles between numerical bins,
-				! so the original parcel1%d interval is no longer associated with bin i.
-				! Classify using the representative dry-equivalent diameter reconstructed
-				! from the aerosol component masses carried by the remapped population.
-				frac05=merge(1._wp,0._wp,dd(i).gt.0.5e-6_wp)
-			endif
-
-            avail=max(frac05*max(npart(i)-dn_inas(i),0._wp)-dn_demott(i),0._wp)
+            avail=min(max(npart(i)-dn_inas(i),0._wp), &
+                      max(moments(i,iaer05),0._wp))
             dprimary=min(nprimary,avail)
             dn_demott(i)=dn_demott(i)+dprimary
             nprimary=nprimary-dprimary
@@ -4710,6 +4979,35 @@
             mbtot=mb*nb
             mleft=nleft*mnew
 
+            ! Prognostic >0.5-micron aerosol cores follow the frozen
+            ! droplets.  DeMott-selected droplets must remove at least one
+            ! eligible core each when the mean core count is below one; once
+            ! coalescence gives more than one core per drop, use the mean core
+            ! loading of the selected drops.  Any additional (e.g. Koop)
+            ! freezing samples the remaining core population proportionally.
+            n_before=max(npart(k),0._wp)
+            aer05_total=max(moments(k,iaer05),0._wp)
+            aer05_demott=0._wp
+            if (dn_demott(k).gt.qsmall2 .and. n_before.gt.qsmall2 .and. &
+                aer05_total.gt.qsmall2) then
+                if (aer05_total.le.n_before) then
+                    aer05_demott=min(aer05_total,dn_demott(k))
+                else
+                    aer05_demott=min(aer05_total, &
+                        dn_demott(k)*aer05_total/n_before)
+                endif
+            endif
+            aer05_remaining=max(aer05_total-aer05_demott,0._wp)
+            n_after_demott=max(n_before-dn_demott(k),0._wp)
+            other_freeze=max(dn01(k)-dn_demott(k),0._wp)
+            aer05_other=0._wp
+            if (other_freeze.gt.qsmall2 .and. n_after_demott.gt.qsmall2) then
+                aer05_other=min(aer05_remaining, &
+                    aer05_remaining*min(other_freeze/n_after_demott,1._wp))
+            endif
+            aer05_freeze(k)=min(aer05_total,aer05_demott+aer05_other)
+            moments(k,iaer05)=max(aer05_total-aer05_freeze(k),0._wp)
+
             ! Number concentration remaining in the liquid bin.
             npart(k)=npart(k)-dn01(k)
             fracinliq=npart(k)/max(npart(k)+dn01(k),1.e-30_wp)
@@ -4782,6 +5080,15 @@
                     dn_demott(k)*mttot/mall
                 moments(ib+nbinw,idemott)=moments(ib+nbinw,idemott)+ &
                     dn_demott(k)*mbtot/mall
+
+                ! The conserved >0.5-micron aerosol-core count follows the
+                ! same non-cloning fragment partition as the aerosol/IN moments.
+                moments(inew+nbinw,iaer05)=moments(inew+nbinw,iaer05)+ &
+                    aer05_freeze(k)*mleft/mall
+                moments(it+nbinw,iaer05)=moments(it+nbinw,iaer05)+ &
+                    aer05_freeze(k)*mttot/mall
+                moments(ib+nbinw,iaer05)=moments(ib+nbinw,iaer05)+ &
+                    aer05_freeze(k)*mbtot/mall
             endif
 
             m01(inew)=m01(inew)+mleft
@@ -4917,7 +5224,7 @@
         ! This ensures that both callbacks use the same:
         !   * Koehler/FHH activated-particle criterion;
         !   * INAS, DeMott, Daily/DCMEX and Koop mechanisms;
-        !   * flat-within-dry-bin treatment of the DeMott >0.5 um reservoir;
+        !   * prognostic conserved DeMott >0.5 um aerosol-core reservoir;
         !   * IN/provenance-moment depletion and transfer;
         !   * full-moving versus fixed-grid ice receiving-bin treatment;
         !   * aerosol, number, ice-mass, morphology and latent-heat updates.
@@ -5010,8 +5317,9 @@
         real(wp), dimension(n_bin_modew,n_moments), intent(inout) :: moments
         real(wp), dimension(n_bin_modew,n_comps+1), intent(inout) :: mbin
         
-        logical, dimension(n_bin_modew) :: moment_exists
         integer(i4b) :: i,j,thismode, thisbin,newplace
+        logical :: placed
+        real(wp) :: mlower_mc,mupper_mc,tolmass_mc
         real(wp), dimension(n_bin_modew,n_moments) :: momtemp
         real(wp), dimension(n_bin_modew) :: nparttemp, totmass
         
@@ -5024,7 +5332,6 @@
             thismode=(i-1)/n_binst+1                ! this is the mode of i
             thisbin=modulo(i-1,n_binst)+1           ! this is the bin
             if(npart(i).gt.0._wp) then
-                moment_exists(i)=.true.
                 ! if the mass is in the right bin, just add it
                 if ((masses(i).gt.mbinedges(thisbin,thismode)).and. &
                     (masses(i).le.mbinedges(thisbin+1,thismode))) then
@@ -5033,10 +5340,16 @@
                     totmass(i)=totmass(i)+npart(i)*masses(i)
                 else
                     ! if the current mass is not in the correct bin
-                    ! find the bin it should be in
+                    ! find the bin it should be in.  Bin 1 is closed at its
+                    ! lower edge (normally zero) so that particles whose
+                    ! water has completely evaporated (mass=0) are retained
+                    ! in bin 1 rather than silently dropped.
+                    placed=.false.
                     do j=1,n_binst
-                        if ((masses(i).gt.mbinedges(j,thismode)).and. &
+                        if (((masses(i).gt.mbinedges(j,thismode)).or. &
+                             ((j.eq.1).and.(masses(i).ge.mbinedges(1,thismode)))).and. &
                             (masses(i).le.mbinedges(j+1,thismode))) then
+                            placed=.true.
                         
                             newplace=(thismode-1)*n_binst+j
 !                             print *,newplace, j, i,thisbin,thismode,masses(i), mbinedges(j,thismode), &
@@ -5045,8 +5358,17 @@
                             momtemp(newplace,:)=momtemp(newplace,:)+moments(i,:)
                             nparttemp(newplace)=nparttemp(newplace)+npart(i)
                             totmass(newplace)=totmass(newplace)+masses(i)*npart(i)   
+                            exit
                         endif
                     enddo
+                    if (.not.placed) then
+                        print *,'Moving-centre mass outside the fixed grid'
+                        print *,'mode/bin/index = ',thismode,thisbin,i
+                        print *,'mass, grid lower/upper = ',masses(i), &
+                            mbinedges(1,thismode),mbinedges(n_binst+1,thismode)
+                        print *,'npart = ',npart(i)
+                        error stop 'moving-centre mass outside fixed grid'
+                    endif
                 endif                
             endif
         enddo
@@ -5062,13 +5384,30 @@
                 npart(i)=nparttemp(i)
                 masses(i)=totmass(i) / npart(i)
                 mbin(i,1:n_comps)=moments(i,1:n_comps)/npart(i)
-                if (.not.((masses(i).gt.mbinedges(thisbin,thismode)).and. &
-                    (masses(i).le.mbinedges(thisbin+1,thismode)))) then
-                    
-                    masses(i)=0.5_wp*(mbinedges(thisbin,thismode)+ &
-                                    mbinedges(thisbin+1,thismode))
-                    npart(i)=totmass(i) / masses(i)
-                endif                
+
+                ! A destination bin contains only source representatives whose
+                ! masses lie inside this fixed interval.  Their number-weighted
+                ! mean must therefore also lie inside the same interval.  The
+                ! historical fallback moved the representative mass to the bin
+                ! midpoint and then changed npart to preserve hydrometeor mass;
+                ! that breaks consistency with the already-conserved extensive
+                ! component moments.  Treat a genuine violation as an error and
+                ! clip only roundoff-sized excursions at a boundary.
+                mlower_mc=mbinedges(thisbin,thismode)
+                mupper_mc=mbinedges(thisbin+1,thismode)
+                tolmass_mc=1000._wp*epsilon(1._wp)* &
+                    max(abs(mlower_mc),abs(mupper_mc),abs(masses(i)), &
+                        abs(mupper_mc-mlower_mc),tiny(1._wp))
+                if ((masses(i) < mlower_mc-tolmass_mc).or. &
+                    (masses(i) > mupper_mc+tolmass_mc)) then
+                    print *,'Moving-centre representative mass outside destination bin'
+                    print *,'mode/bin/index = ',thismode,thisbin,i
+                    print *,'lower,mean,upper = ',mlower_mc,masses(i),mupper_mc
+                    print *,'npart,total hydrometeor mass = ',npart(i),totmass(i)
+                    print *,'tolerance = ',tolmass_mc
+                    error stop 'moving-centre destination mean outside bin'
+                endif
+                masses(i)=min(max(masses(i),mlower_mc),mupper_mc)
                 mbin(i,n_comps+1)=masses(i)
             else
                 moments(i,:)=0._wp
@@ -5081,6 +5420,394 @@
         enddo   
     end subroutine moving_centre
 	!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
+	! ============================================================================
+	! full_moving_water_bracket
+	! ============================================================================
+	!>@brief
+	!>Finds the two OCCUPIED current full-moving water-mass pivots that bracket a
+	!>source water mass within the same external aerosol mode.  Empty numerical
+	!>categories are deliberately ignored: in a full-moving representation their
+	!>stored pivot is only a placeholder until a population occupies the category.
+	!>The pivots need not be ordered in array index after collection; lower and
+	!>upper are diagnosed by mass.  outside_range is true if the requested source
+	!>mass lies outside the occupied range (or the mode has no occupied category).
+	!>The endpoint returned in that case is retained only as a fallback if the
+	!>caller cannot allocate a spare empty full-moving category.
+	subroutine full_moving_water_bracket(isrc,mwater,ilo,ihi,wlo,whi,outside_range)
+		implicit none
+		integer(i4b), intent(in) :: isrc
+		real(wp), intent(in) :: mwater
+		integer(i4b), intent(out) :: ilo,ihi
+		real(wp), intent(out) :: wlo,whi
+		logical, intent(out) :: outside_range
+		integer(i4b) :: imode,j,jlo,jhi,ilower,iupper
+		real(wp) :: m,mlower,mupper,denom
+		logical :: found_lower,found_upper
+
+		imode=(isrc-1)/parcel1%n_bins1+1
+		jlo=(imode-1)*parcel1%n_bins1+1
+		jhi=imode*parcel1%n_bins1
+		mlower=-huge(1._wp)
+		mupper= huge(1._wp)
+		ilower=jlo
+		iupper=jlo
+		found_lower=.false.
+		found_upper=.false.
+
+		do j=jlo,jhi
+			! Only populated categories define the current moving PSD.  In particular,
+			! the initially empty 61--140 categories must not act as fixed pivots here.
+			if (parcel1%npart(j).le.tiny(1._wp)) cycle
+			m=max(parcel1%y(j),0._wp)
+			if (m.le.mwater .and. m.gt.mlower) then
+				mlower=m
+				ilower=j
+				found_lower=.true.
+			endif
+			if (m.ge.mwater .and. m.lt.mupper) then
+				mupper=m
+				iupper=j
+				found_upper=.true.
+			endif
+		enddo
+
+		outside_range=.false.
+
+		! Outside the OCCUPIED represented range.  Return the nearest occupied
+		! endpoint as a conservative fallback; merge_full_moving_warm_source first
+		! tries to replace this fallback with a newly occupied empty category.
+		if (.not.found_lower .or. .not.found_upper) then
+			outside_range=.true.
+			if (.not.found_lower .and. found_upper) then
+				ilo=iupper
+				ihi=iupper
+			elseif (found_lower .and. .not.found_upper) then
+				ilo=ilower
+				ihi=ilower
+			else
+				! No occupied category at all in this external mode.
+				ilo=jlo
+				ihi=jlo
+			endif
+			wlo=1._wp
+			whi=0._wp
+			return
+		endif
+
+		ilo=ilower
+		ihi=iupper
+		if (ilo.eq.ihi) then
+			wlo=1._wp
+			whi=0._wp
+			return
+		endif
+
+		denom=mupper-mlower
+		if (denom.le.tiny(1._wp)) then
+			wlo=1._wp
+			whi=0._wp
+			ihi=ilo
+		else
+			whi=max(0._wp,min((mwater-mlower)/denom,1._wp))
+			wlo=1._wp-whi
+		endif
+	end subroutine full_moving_water_bracket
+
+
+	! ============================================================================
+	! find_pending_full_moving_bin
+	! ============================================================================
+	!>@brief
+	!>Finds a category already reserved by this merge call for a split source at
+	!>the same water-mass coordinate.  This is especially important for complete
+	!>evaporation: many source populations can all produce mwater=0 residuals and
+	!>should accumulate into ONE distinct dry population, not consume one category
+	!>per source bin.
+	subroutine find_pending_full_moving_bin(isrc,mwater,nadd,wateradd,jpending)
+		implicit none
+		integer(i4b), intent(in) :: isrc
+		real(wp), intent(in) :: mwater
+		real(wp), dimension(:), intent(in) :: nadd,wateradd
+		integer(i4b), intent(out) :: jpending
+		integer(i4b) :: imode,j,jlo,jhi
+		real(wp) :: mpending,target,tol
+
+		imode=(isrc-1)/parcel1%n_bins1+1
+		jlo=(imode-1)*parcel1%n_bins1+1
+		jhi=imode*parcel1%n_bins1
+		jpending=0
+		target=max(mwater,0._wp)
+
+		do j=jlo,jhi
+			if (nadd(j).le.tiny(1._wp)) cycle
+			mpending=wateradd(j)/max(nadd(j),tiny(1._wp))
+			tol=max(1.e-14_wp*max(abs(target),abs(mpending),1.e-30_wp), &
+				100._wp*tiny(1._wp))
+			if (abs(mpending-target).le.tol) then
+				jpending=j
+				return
+			endif
+		enddo
+	end subroutine find_pending_full_moving_bin
+
+
+	! ============================================================================
+	! find_empty_full_moving_bin
+	! ============================================================================
+	!>@brief
+	!>Returns an unoccupied/unreserved full-moving category in the same external
+	!>aerosol mode as isrc.  The category whose placeholder/reference water mass
+	!>is closest (in log mass) to mwater is preferred, although the receiving
+	!>pivot will subsequently move exactly to the inserted population mean.
+	!>nadd is included so that two source populations handled in the same merge
+	!>call cannot independently reserve the same initially empty category.
+	subroutine find_empty_full_moving_bin(isrc,mwater,nadd,jempty)
+		implicit none
+		integer(i4b), intent(in) :: isrc
+		real(wp), intent(in) :: mwater
+		real(wp), dimension(:), intent(in) :: nadd
+		integer(i4b), intent(out) :: jempty
+		integer(i4b) :: imode,j,jlo,jhi
+		real(wp) :: score,best_score,mref,mtarget
+
+		imode=(isrc-1)/parcel1%n_bins1+1
+		jlo=(imode-1)*parcel1%n_bins1+1
+		jhi=imode*parcel1%n_bins1
+		jempty=0
+		best_score=huge(1._wp)
+		mtarget=max(mwater,tiny(1._wp))
+
+		do j=jlo,jhi
+			if (parcel1%npart(j).gt.tiny(1._wp)) cycle
+			if (nadd(j).gt.tiny(1._wp)) cycle
+
+			mref=max(parcel1%y(j),tiny(1._wp))
+			score=abs(log(mref)-log(mtarget))
+			if (score.lt.best_score) then
+				best_score=score
+				jempty=j
+			endif
+		enddo
+	end subroutine find_empty_full_moving_bin
+
+
+
+
+	! ============================================================================
+	! compact_full_moving_mode_for_slot
+	! ============================================================================
+	!>@brief
+	!>Frees one numerical category in the same external full-moving mode as isrc
+	!>when a split population must be represented but every category is occupied.
+	!>
+	!>The two currently occupied, unreserved populations closest in WATER-MASS
+	!>coordinate are merged conservatively.  Number, liquid water, every aerosol
+	!>component and every carried extensive moment are summed exactly.  The freed
+	!>category can then hold the new split population explicitly.
+	!>
+	!>This is an adaptive-resolution operation: it sacrifices the least-resolved
+	!>pair in the existing water-mass PSD rather than destroying the new dry/wet
+	!>state distinction by averaging the source directly into an endpoint.
+	subroutine compact_full_moving_mode_for_slot(isrc,nadd,jempty)
+		implicit none
+		integer(i4b), intent(in) :: isrc
+		real(wp), dimension(:), intent(in) :: nadd
+		integer(i4b), intent(out) :: jempty
+		integer(i4b) :: imode,j,k,jlo,jhi,jkeep,jfree,ic
+		real(wp) :: mj,mk,score,best_score,nj,nk,nnew,water_total,scale_mass
+
+		imode=(isrc-1)/parcel1%n_bins1+1
+		jlo=(imode-1)*parcel1%n_bins1+1
+		jhi=imode*parcel1%n_bins1
+		jempty=0
+		best_score=huge(1._wp)
+		jkeep=0
+		jfree=0
+
+		! Do not compact a category already reserved by a pending source addition.
+		! Choose the closest occupied pair in log water-mass space.  A small
+		! additive scale keeps dry/near-dry populations well behaved.
+		scale_mass=tiny(1._wp)
+		do j=jlo,jhi-1
+			if (parcel1%npart(j).le.tiny(1._wp)) cycle
+			if (nadd(j).gt.tiny(1._wp)) cycle
+			mj=max(parcel1%y(j),0._wp)
+			do k=j+1,jhi
+				if (parcel1%npart(k).le.tiny(1._wp)) cycle
+				if (nadd(k).gt.tiny(1._wp)) cycle
+				mk=max(parcel1%y(k),0._wp)
+				score=abs(log(mj+scale_mass)-log(mk+scale_mass))
+				if (score.lt.best_score) then
+					best_score=score
+					jkeep=j
+					jfree=k
+				endif
+			enddo
+		enddo
+
+		if (jkeep.eq.0 .or. jfree.eq.0) error stop &
+			'No pair available to compact full-moving mode for residual release'
+
+		nj=max(parcel1%npart(jkeep),0._wp)
+		nk=max(parcel1%npart(jfree),0._wp)
+		nnew=nj+nk
+		if (nnew.le.tiny(1._wp)) error stop &
+			'Invalid zero-number pair in full-moving compaction'
+
+		water_total=nj*max(parcel1%y(jkeep),0._wp)+ &
+			nk*max(parcel1%y(jfree),0._wp)
+		parcel1%npart(jkeep)=nnew
+		parcel1%y(jkeep)=water_total/nnew
+		parcel1%moments(jkeep,:)=parcel1%moments(jkeep,:)+ &
+			parcel1%moments(jfree,:)
+		do ic=1,parcel1%n_comps
+			parcel1%mbin(jkeep,ic)=parcel1%moments(jkeep,ic)/nnew
+		enddo
+		parcel1%mbin(jkeep,parcel1%n_comps+1)=parcel1%y(jkeep)
+
+		! jfree is now genuinely empty and can be occupied by the split source.
+		parcel1%npart(jfree)=0._wp
+		parcel1%y(jfree)=0._wp
+		parcel1%moments(jfree,:)=0._wp
+		parcel1%mbin(jfree,:)=0._wp
+		jempty=jfree
+	end subroutine compact_full_moving_mode_for_slot
+
+
+	! ============================================================================
+	! merge_full_moving_warm_source
+	! ============================================================================
+	!>@brief
+	!>Conservatively adds fresh/entrained or released aerosol to a full-moving
+	!>warm population.  insertion_mode=0 keeps each source in the same numerical
+	!>index.  insertion_mode=1 restores the original full-moving interpretation:
+	!>the source is placed in WATER-MASS coordinate.  If it lies between occupied
+	!>pivots, number and all extensive moments are partitioned between those two
+	!>pivots.  If it lies outside the occupied range (notably a dry residual), an
+	!>empty category is used so the new population remains distinct.  Multiple
+	!>sources at the same outside-range water coordinate (especially dry residuals
+	!>at mwater=0) share that one split category.  If every category is occupied,
+	!>the closest existing water-mass pair is conservatively compacted once to free
+	!>a slot rather than averaging the source into a wet endpoint.
+	subroutine merge_full_moving_warm_source(npart_src,mwater_src,moments_src, &
+		source_scale,insertion_mode)
+		implicit none
+		real(wp), dimension(:), intent(in) :: npart_src,mwater_src
+		real(wp), dimension(:,:), intent(in) :: moments_src
+		real(wp), intent(in), optional :: source_scale
+		integer(i4b), intent(in), optional :: insertion_mode
+		integer(i4b) :: i,j,n,nmom,mode,ilo,ihi,jempty,jpending,n_compact
+		real(wp) :: scale,nin,nold,nnew,water_total,wlo,whi
+		logical :: outside_range
+		real(wp), allocatable :: nadd(:),wateradd(:),momadd(:,:)
+
+		if (parcel1%bin_scheme_flag.ne.BIN_FULL_MOVING) error stop &
+			'merge_full_moving_warm_source called for non-full-moving scheme'
+
+		n=parcel1%n_bin_modew
+		nmom=parcel1%n_comps+parcel1%imoms
+		if (size(npart_src).ne.n .or. size(mwater_src).ne.n) error stop &
+			'full-moving source has wrong warm-bin dimension'
+		if (size(moments_src,1).ne.n .or. size(moments_src,2).ne.nmom) error stop &
+			'full-moving source moments have wrong dimensions'
+
+		scale=1._wp
+		if (present(source_scale)) scale=max(source_scale,0._wp)
+		if (scale.le.tiny(1._wp)) return
+		mode=full_moving_release_mode
+		if (present(insertion_mode)) mode=insertion_mode
+		if (mode.ne.FULL_MOVING_RELEASE_SAME_INDEX .and. &
+			mode.ne.FULL_MOVING_RELEASE_PARTITION) error stop &
+			'unknown full-moving source insertion mode'
+
+		allocate(nadd(n),wateradd(n),momadd(n,nmom))
+		nadd=0._wp
+		wateradd=0._wp
+		momadd=0._wp
+		n_compact=0
+
+		do i=1,n
+			nin=scale*npart_src(i)
+			if (nin.le.tiny(1._wp)) cycle
+			if (mwater_src(i).ne.mwater_src(i)) error stop &
+				'non-finite source water mass in full-moving merge'
+
+			if (mode.eq.FULL_MOVING_RELEASE_SAME_INDEX) then
+				ilo=i
+				ihi=i
+				wlo=1._wp
+				whi=0._wp
+			else
+				call full_moving_water_bracket(i,max(mwater_src(i),0._wp), &
+					ilo,ihi,wlo,whi,outside_range)
+
+				if (outside_range) then
+					! First reuse a split population already reserved at the same water
+					! coordinate during THIS merge call.  Complete evaporation commonly
+					! sends many source bins to mwater=0; these belong in one dry moving
+					! population, not one separate numerical category per source bin.
+					call find_pending_full_moving_bin(i,max(mwater_src(i),0._wp), &
+						nadd,wateradd,jpending)
+
+					if (jpending.gt.0) then
+						jempty=jpending
+					else
+						! Otherwise prefer a genuinely empty category.
+						call find_empty_full_moving_bin(i,max(mwater_src(i),0._wp), &
+							nadd,jempty)
+
+						if (jempty.eq.0) then
+							! All categories are occupied.  Compact ONE nearby existing
+							! pair to free a slot.  Subsequent sources at this same water
+							! coordinate will reuse the reserved slot above.
+							call compact_full_moving_mode_for_slot(i,nadd,jempty)
+							n_compact=n_compact+1
+						endif
+					endif
+
+					ilo=jempty
+					ihi=jempty
+					wlo=1._wp
+					whi=0._wp
+				endif
+			endif
+
+			if (wlo.gt.0._wp) then
+				nadd(ilo)=nadd(ilo)+wlo*nin
+				wateradd(ilo)=wateradd(ilo)+wlo*nin*max(mwater_src(i),0._wp)
+				momadd(ilo,:)=momadd(ilo,:)+wlo*scale*moments_src(i,:)
+			endif
+			if (whi.gt.0._wp) then
+				nadd(ihi)=nadd(ihi)+whi*nin
+				wateradd(ihi)=wateradd(ihi)+whi*nin*max(mwater_src(i),0._wp)
+				momadd(ihi,:)=momadd(ihi,:)+whi*scale*moments_src(i,:)
+			endif
+		enddo
+
+		do i=1,n
+			if (nadd(i).le.tiny(1._wp)) cycle
+			nold=max(parcel1%npart(i),0._wp)
+			nnew=nold+nadd(i)
+			water_total=nold*max(parcel1%y(i),0._wp)+wateradd(i)
+			parcel1%npart(i)=nnew
+			parcel1%y(i)=water_total/max(nnew,tiny(1._wp))
+			parcel1%moments(i,:)=parcel1%moments(i,:)+momadd(i,:)
+			do j=1,parcel1%n_comps
+				parcel1%mbin(i,j)=parcel1%moments(i,j)/nnew
+			enddo
+			parcel1%mbin(i,parcel1%n_comps+1)=parcel1%y(i)
+		enddo
+
+
+		if (n_compact.gt.0) then
+			print *,'INFO: full-moving release compacted ',n_compact, &
+				' occupied PSD pair(s) to create distinct split coordinate(s)'
+		endif
+
+		deallocate(nadd,wateradd,momadd)
+	end subroutine merge_full_moving_warm_source
 
 
 	! ============================================================================
@@ -5348,6 +6075,100 @@
 	end subroutine chen_lamb_distribution
 	!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+
+    ! ============================================================================
+    ! chen_lamb_activated_number
+    ! ============================================================================
+    !>Return the number of activated particles represented by one occupied
+    !>Chen-Lamb fixed bin.  The current bin number and first water-mass moment
+    !>define the same positive linear within-bin distribution used by the
+    !>Chen-Lamb remapping scheme.  Only the portion with water mass greater
+    !>than the Koehler/FHH critical water mass is counted.
+    !>
+    !>If the bin mean lies at a boundary to within roundoff, the finite-width
+    !>linear reconstruction degenerates to a point population; in that limit
+    !>the point activation criterion is used directly.
+    real(wp) function chen_lamb_activated_number(ibin,t_current) result(nactivated)
+        implicit none
+        integer(i4b), intent(in) :: ibin
+        real(wp), intent(in) :: t_current
+        integer(i4b) :: ibin_local,imode_local
+        real(wp) :: nbin,mean_mass,total_mass,lower,upper,mcrit_local
+        real(wp) :: nref,xref,slope,xlo,xhi,a,tolmass,toln
+
+        nactivated=0._wp
+        if (ibin < 1 .or. ibin > parcel1%n_bin_modew) return
+
+        nbin=parcel1%npart(ibin)
+        if (nbin <= tiny(1._wp)) return
+
+        mean_mass=parcel1%y(ibin)
+        if (mean_mass <= tiny(1._wp)) return
+
+        ibin_local=mod(ibin-1,parcel1%n_bins1)+1
+        imode_local=(ibin-1)/parcel1%n_bins1+1
+        lower=parcel1%mbinedges(ibin_local,imode_local)
+        upper=parcel1%mbinedges(ibin_local+1,imode_local)
+        if (upper <= lower) then
+            print *,'Invalid water-mass bin in Chen-Lamb activation diagnostic'
+            print *,'mode/bin/index = ',imode_local,ibin_local,ibin
+            print *,'lower,upper = ',lower,upper
+            error stop 'non-positive Chen-Lamb diagnostic bin width'
+        endif
+
+        tolmass=1000._wp*epsilon(1._wp)* &
+            max(abs(lower),abs(upper),abs(mean_mass), &
+                abs(upper-lower),tiny(1._wp))
+        if ((mean_mass < lower-tolmass).or. &
+            (mean_mass > upper+tolmass)) then
+            print *,'Chen-Lamb diagnostic mean outside fixed bin'
+            print *,'mode/bin/index = ',imode_local,ibin_local,ibin
+            print *,'lower,mean,upper = ',lower,mean_mass,upper
+            print *,'npart,tolerance = ',nbin,tolmass
+            error stop 'Chen-Lamb diagnostic mean outside bin'
+        endif
+        mean_mass=min(max(mean_mass,lower),upper)
+
+        mcrit_local=particle_activation_water_mass(ibin,t_current)
+
+        ! A mean at either boundary corresponds to the limiting point-mass
+        ! representation for which chen_lamb_distribution has zero support.
+        if ((mean_mass-lower <= tolmass).or. &
+            (upper-mean_mass <= tolmass)) then
+            if (mean_mass > mcrit_local) nactivated=nbin
+            return
+        endif
+
+        total_mass=nbin*mean_mass
+        call chen_lamb_distribution(lower,upper,nbin,total_mass, &
+            nref,xref,slope,xlo,xhi)
+
+        if (mcrit_local < xlo) then
+            nactivated=nbin
+        elseif (mcrit_local >= xhi) then
+            nactivated=0._wp
+        else
+            ! particle_is_activated uses mwat > mcrit.  A single boundary
+            ! point has zero measure in the continuous Chen-Lamb distribution,
+            ! so integrating from mcrit or just above it is equivalent.
+            a=max(mcrit_local,xlo)
+            nactivated=chen_lamb_int_number(nref,xref,slope,a,xhi)
+        endif
+
+        ! Protect only against integration-level roundoff; a material failure
+        ! of the reconstructed number integral should not be silently hidden.
+        toln=1.e-10_wp*max(abs(nbin),1.e-300_wp)
+        if ((nactivated < -toln).or.(nactivated > nbin+toln)) then
+            print *,'Invalid Chen-Lamb activated number'
+            print *,'mode/bin/index = ',imode_local,ibin_local,ibin
+            print *,'Nbin,Nactivated = ',nbin,nactivated
+            print *,'support/mcrit = ',xlo,xhi,mcrit_local
+            print *,'mean mass = ',mean_mass
+            error stop 'Chen-Lamb activated-number integration failure'
+        endif
+        nactivated=min(max(nactivated,0._wp),nbin)
+    end function chen_lamb_activated_number
+    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 	! ============================================================================
@@ -6053,19 +6874,34 @@
 					mbin(idest,1:n_comps)= &
 						moments(idest,1:n_comps)/npart(idest)
 	
-					! Current water/ice mass per particle
-					mbin(idest,n_comps+1)=mass_new(idest)
 					! The destination mean must lie inside the destination
-					! fixed mass interval.
-					if ((mass_new(idest) < mbinedges(idbin,imode)).or. &
-						(mass_new(idest) > mbinedges(idbin+1,imode))) then
+					! fixed mass interval.  A mathematically valid mean can
+					! land exactly on a fixed-bin boundary; accumulated roundoff
+					! may then put it a few ulps outside the interval.  Accept only
+					! an O(epsilon) excursion and clamp it back to the boundary.
+					tolM=100._wp*epsilon(1._wp)*max( &
+						abs(mbinedges(idbin,imode)), &
+						abs(mbinedges(idbin+1,imode)), &
+						abs(mass_new(idest)),tiny(1._wp))
+					if ((mass_new(idest) < mbinedges(idbin,imode)-tolM).or. &
+						(mass_new(idest) > mbinedges(idbin+1,imode)+tolM)) then
 						print *,'Chen-Lamb destination mean outside bin'
 						print *,'mode/bin = ',imode,idbin
 						print *,'lower,mean,upper = ', &
 							mbinedges(idbin,imode), &
-							mass_new(idest), mbinedges(idbin+1,imode)
+							mass_new(idest),mbinedges(idbin+1,imode)
+						print *,'allowed tolerance = ',tolM
 						error stop
 					endif
+
+					! Remove only roundoff-sized excursions before storing the
+					! representative phase mass in mbin.
+					mass_new(idest)=min( &
+						max(mass_new(idest),mbinedges(idbin,imode)), &
+						mbinedges(idbin+1,imode))
+
+					! Current water/ice mass per particle
+					mbin(idest,n_comps+1)=mass_new(idest)
 				else
 					npart(idest)=0._wp
 					moments(idest,:)=0._wp
@@ -6917,43 +7753,70 @@
         ! fraction.  Existing parcel particles have already been diluted by
         ! dilute_send inside entrainment(); the environmental contribution is
         ! therefore (1-dilute_send) times the fixed t=0 environmental PSD.
+        !
+        ! For full-moving, do NOT assume that environmental source index i is
+        ! still the correct parcel receiving index after condensation/SCE.
+        ! Hydrate the source in entrainment(), then conservatively partition it
+        ! between the bracketing current water-mass pivots in the same external
+        ! mode. Fixed-grid schemes retain their historical source-grid remap and
+        ! index-wise addition.
         if (entrain_aerosol) then
-            where ((parcel1%npart + (1._wp-dilute_send)*parcel1%npart_ent) > 0._wp)
-                parcel1%y(1:parcel1%n_bin_modew)= &
-                    parcel1%y(1:parcel1%n_bin_modew)*parcel1%npart + &
+            if (parcel1%bin_scheme_flag.eq.BIN_FULL_MOVING) then
+                call merge_full_moving_warm_source( &
+                    parcel1%npart_ent, &
+                    parcel1%mbin_ent(:,parcel1%n_comps+1), &
+                    parcel1%moments_ent(1:parcel1%n_bin_modew,:), &
+                    1._wp-dilute_send,FULL_MOVING_RELEASE_PARTITION)
+            else
+                where ((parcel1%npart + (1._wp-dilute_send)*parcel1%npart_ent) > 0._wp)
+                    parcel1%y(1:parcel1%n_bin_modew)= &
+                        parcel1%y(1:parcel1%n_bin_modew)*parcel1%npart + &
+                        (1._wp-dilute_send)* &
+                        parcel1%mbin_ent(1:parcel1%n_bin_modew,parcel1%n_comps+1) * &
+                        parcel1%npart_ent
+                    parcel1%y(1:parcel1%n_bin_modew)= &
+                        parcel1%y(1:parcel1%n_bin_modew)/ &
+                        (parcel1%npart + (1._wp-dilute_send)*parcel1%npart_ent)
+                end where
+                parcel1%moments(1:parcel1%n_bin_modew,:)= &
+                    parcel1%moments(1:parcel1%n_bin_modew,:) + &
                     (1._wp-dilute_send)* &
-                    parcel1%mbin_ent(1:parcel1%n_bin_modew,parcel1%n_comps+1) * &
-                    parcel1%npart_ent
-                parcel1%y(1:parcel1%n_bin_modew)= &
-                    parcel1%y(1:parcel1%n_bin_modew)/ &
-                    (parcel1%npart + (1._wp-dilute_send)*parcel1%npart_ent)
-            end where
-            parcel1%moments=parcel1%moments + &
-                (1._wp-dilute_send)*parcel1%moments_ent
-            parcel1%npart=parcel1%npart + &
-                (1._wp-dilute_send)*parcel1%npart_ent
+                    parcel1%moments_ent(1:parcel1%n_bin_modew,:)
+                parcel1%npart=parcel1%npart + &
+                    (1._wp-dilute_send)*parcel1%npart_ent
+            endif
         endif
 
         ! Add aerosol residuals produced by the discrete inhomogeneous event.
         ! This is independent of whether the next timestep has already switched
-        ! to homogeneous mixing.
+        ! to homogeneous mixing. Full-moving residuals use the configured
+        ! full_moving_release_mode (same source index by default, or conservative
+        ! water-mass partitioning). This includes aerosol from completely
+        ! sublimated ice and preserves its existing prognostic moments.
         if (l_inhom_event) then
-            where ((parcel1%npart + parcel1%npart_temp) .gt. 0._wp)
-                parcel1%y(1:parcel1%n_bin_modew)= &
-                    parcel1%y(1:parcel1%n_bin_modew)*parcel1%npart + &
-                    parcel1%mbin_temp(1:parcel1%n_bin_modew,parcel1%n_comps+1) * &
-                    parcel1%npart_temp
-                parcel1%y(1:parcel1%n_bin_modew)= &
-                    parcel1%y(1:parcel1%n_bin_modew)/ &
-                    max(parcel1%npart + parcel1%npart_temp,1.e-30_wp)
-            end where
-            parcel1%moments=parcel1%moments + parcel1%moments_temp
-            parcel1%npart=parcel1%npart + parcel1%npart_temp
+            if (parcel1%bin_scheme_flag.eq.BIN_FULL_MOVING) then
+                call merge_full_moving_warm_source( &
+                    parcel1%npart_temp, &
+                    parcel1%mbin_temp(:,parcel1%n_comps+1), &
+                    parcel1%moments_temp(1:parcel1%n_bin_modew,:))
+            else
+                where ((parcel1%npart + parcel1%npart_temp) .gt. 0._wp)
+                    parcel1%y(1:parcel1%n_bin_modew)= &
+                        parcel1%y(1:parcel1%n_bin_modew)*parcel1%npart + &
+                        parcel1%mbin_temp(1:parcel1%n_bin_modew,parcel1%n_comps+1) * &
+                        parcel1%npart_temp
+                    parcel1%y(1:parcel1%n_bin_modew)= &
+                        parcel1%y(1:parcel1%n_bin_modew)/ &
+                        max(parcel1%npart + parcel1%npart_temp,1.e-30_wp)
+                end where
+                parcel1%moments(1:parcel1%n_bin_modew,:)= &
+                    parcel1%moments(1:parcel1%n_bin_modew,:)+ &
+                    parcel1%moments_temp(1:parcel1%n_bin_modew,:)
+                parcel1%npart=parcel1%npart + parcel1%npart_temp
+            endif
         endif
 
-        ! Keep the per-particle component masses consistent even when the
-        ! full-moving scheme does not call moving_centre below.  Entrainment
-        ! changes number and extensive component masses independently.
+        ! Keep per-particle component masses synchronized after source addition.
         do i=1,parcel1%n_bin_modew
             if (parcel1%npart(i).gt.tiny(1._wp)) then
                 parcel1%mbin(i,1:parcel1%n_comps)= &
@@ -7534,17 +8397,24 @@
 	!>ice-only/current-ice state, including n_demott, is reset.  If
 	!>release_aerosol=.false. the residual population is intentionally discarded.
     subroutine prepare_released_hydrometeor_aerosol(liq_factor,ice_factor, &
-        t_resid,rh_resid,force_release,liq_factors,all_warm_liquid)
+        t_resid,rh_resid,force_release,liq_factors,all_warm_liquid, &
+        residual_water_masses)
         implicit none
         real(wp), intent(in) :: liq_factor,ice_factor,t_resid,rh_resid
         logical, intent(in), optional :: force_release
         real(wp), dimension(:), intent(in), optional :: liq_factors
         logical, intent(in), optional :: all_warm_liquid
+        real(wp), dimension(:), intent(in), optional :: residual_water_masses
         integer(i4b) :: i,j,ii,n
         real(wp) :: residual_water,liq_factor_i
-        logical :: do_release,include_all_warm
+        real(wp), allocatable :: release_mass_old(:)
+        logical :: do_release,include_all_warm,have_liquid_release
 
         n=parcel1%n_bin_modew
+        if (present(residual_water_masses)) then
+            if (size(residual_water_masses).ne.n) error stop &
+                'residual_water_masses has wrong size in prepare_released_hydrometeor_aerosol'
+        endif
         parcel1%npart_temp=0._wp
         parcel1%moments_temp=0._wp
         parcel1%mbin_temp=0._wp
@@ -7555,6 +8425,9 @@
         if (.not.do_release) return
         include_all_warm=.false.
         if (present(all_warm_liquid)) include_all_warm=all_warm_liquid
+        have_liquid_release=.false.
+        allocate(release_mass_old(n))
+        release_mass_old=parcel1%y(1:n)
 
         ! A fraction of each eligible old warm-bin population belongs to the
         ! part of the cloud whose droplets evaporate completely.  Interstitial
@@ -7584,6 +8457,7 @@
                     if (.not.particle_is_activated(i,parcel1%y(i), &
                         parcel1%y(parcel1%ite))) cycle
                 endif
+                have_liquid_release=.true.
                 parcel1%npart_temp(i)=parcel1%npart_temp(i)+ &
                     liq_factor_i*parcel1%npart(i)
                 parcel1%moments_temp(i,1:parcel1%n_comps)= &
@@ -7596,6 +8470,11 @@
                         parcel1%iinp_start+parcel1%n_inp_classes-1)+ &
                         liq_factor_i*parcel1%moments(i,parcel1%iinp_start: &
                         parcel1%iinp_start+parcel1%n_inp_classes-1)
+                endif
+                if (parcel1%ice_flag.eq.1) then
+                    parcel1%moments_temp(i,parcel1%iaer05)= &
+                        parcel1%moments_temp(i,parcel1%iaer05)+ &
+                        liq_factor_i*parcel1%moments(i,parcel1%iaer05)
                 endif
             enddo
         endif
@@ -7620,6 +8499,9 @@
                         ice_factor*parcel1%moments(ii,parcel1%iinp_start: &
                         parcel1%iinp_start+parcel1%n_inp_classes-1)
                 endif
+                parcel1%moments_temp(i,parcel1%iaer05)= &
+                    parcel1%moments_temp(i,parcel1%iaer05)+ &
+                    ice_factor*parcel1%moments(ii,parcel1%iaer05)
             enddo
         endif
 
@@ -7629,9 +8511,18 @@
                 parcel1%mbin_temp(i,j)= &
                     parcel1%moments_temp(i,j)/parcel1%npart_temp(i)
             enddo
-            call equilibrium_residual_water_mass(i, &
-                parcel1%mbin_temp(i,1:parcel1%n_comps),t_resid,rh_resid, &
-                residual_water)
+            if (present(residual_water_masses)) then
+                ! The chamber-BL inhomogeneous solver has already calculated
+                ! the admissible residual water for this source bin and used it
+                ! when solving the NET liquid-water target.  Use exactly that
+                ! value here so target fitting and actual residual release are
+                ! mathematically identical.
+                residual_water=max(residual_water_masses(i),0._wp)
+            else
+                call equilibrium_residual_water_mass(i, &
+                    parcel1%mbin_temp(i,1:parcel1%n_comps),t_resid,rh_resid, &
+                    residual_water)
+            endif
             parcel1%mbin_temp(i,parcel1%n_comps+1)=residual_water
 
             if (parcel1%ice_flag.eq.1) then
@@ -7648,15 +8539,54 @@
             endif
         enddo
 
-        if ((sum(parcel1%npart_temp).gt.tiny(1._wp)).and. &
-            (parcel1%bin_scheme_flag.ne.BIN_FULL_MOVING)) then
-            call moving_centre(parcel1%n_bin_mode,parcel1%n_bin_modew, &
-                parcel1%n_bins1,parcel1%n_modes,parcel1%n_comps, &
-                parcel1%imoms+parcel1%n_comps,parcel1%npart_temp, &
-                parcel1%mbin_temp(:,parcel1%n_comps+1), &
-                parcel1%moments_temp(1:n,:),parcel1%mbin_temp, &
-                parcel1%mbinedges_temp)
+        if (sum(parcel1%npart_temp).gt.tiny(1._wp)) then
+            select case(parcel1%bin_scheme_flag)
+            case(BIN_FULL_MOVING)
+                ! Full-moving residuals are deliberately left in source-index
+                ! form here. merge_released_aerosol_into_warm() applies the
+                ! selected full_moving_release_mode afterwards.
+
+            case(BIN_CHEN_LAMB)
+                if (have_liquid_release .and. ice_factor.le.tiny(1._wp)) then
+                    ! A completely evaporated LIQUID fraction still has a known
+                    ! Chen-Lamb source interval.  Remap that finite-width source
+                    ! population from its pre-evaporation mean water mass to the
+                    ! diagnosed equilibrium haze mass using the same conservative
+                    ! m**(1/3) edge-motion/integration machinery as ordinary
+                    ! Chen-Lamb diffusional growth.  A source interval may span
+                    ! any number of destination bins; chen_lamb_growth_remap()
+                    ! integrates every overlap and conserves number, water mass
+                    ! and all carried extensive moments.
+                    call chen_lamb_growth_remap(parcel1%n_bin_modew, &
+                        parcel1%n_bins1,parcel1%n_modes,parcel1%n_comps, &
+                        parcel1%imoms+parcel1%n_comps,parcel1%npart_temp, &
+                        release_mass_old, &
+                        parcel1%mbin_temp(:,parcel1%n_comps+1), &
+                        parcel1%moments_temp(1:n,:),parcel1%mbin_temp, &
+                        parcel1%mbinedges_temp)
+                else
+                    ! Ice residuals do not in general retain a warm Chen-Lamb
+                    ! source interval, so keep the existing conservative fixed-
+                    ! interval projection for that path.  Liquid+ice release is
+                    ! not currently generated by the chamber callers.
+                    call moving_centre(parcel1%n_bin_mode,parcel1%n_bin_modew, &
+                        parcel1%n_bins1,parcel1%n_modes,parcel1%n_comps, &
+                        parcel1%imoms+parcel1%n_comps,parcel1%npart_temp, &
+                        parcel1%mbin_temp(:,parcel1%n_comps+1), &
+                        parcel1%moments_temp(1:n,:),parcel1%mbin_temp, &
+                        parcel1%mbinedges_temp)
+                endif
+
+            case default
+                call moving_centre(parcel1%n_bin_mode,parcel1%n_bin_modew, &
+                    parcel1%n_bins1,parcel1%n_modes,parcel1%n_comps, &
+                    parcel1%imoms+parcel1%n_comps,parcel1%npart_temp, &
+                    parcel1%mbin_temp(:,parcel1%n_comps+1), &
+                    parcel1%moments_temp(1:n,:),parcel1%mbin_temp, &
+                    parcel1%mbinedges_temp)
+            end select
         endif
+        deallocate(release_mass_old)
     end subroutine prepare_released_hydrometeor_aerosol
 
 
@@ -7685,7 +8615,7 @@
         rh0=parcel1%y(parcel1%irh)
         call inhomogeneous_liquid_reservoir(ql0)
         qi0=0._wp
-        if (parcel1%ice_flag.eq.1) qi0=sum(parcel1%npartice*parcel1%yice)
+        if (parcel1%ice_flag.eq.1) qi0=sum(parcel1%npartice*parcel1%yice(1:n))
 
         ! First diagnose pure air mixing/dilution with no instantaneous phase
         ! loss.  This mixed RH decides which condensate reservoirs are allowed
@@ -8542,30 +9472,54 @@
         n=parcel1%n_bin_modew
         if (sum(parcel1%npart_temp).le.tiny(1._wp)) return
 
-        do i=1,n
-            nnew=parcel1%npart(i)+parcel1%npart_temp(i)
-            if (nnew.gt.tiny(1._wp)) then
-                parcel1%y(i)=(parcel1%y(i)*parcel1%npart(i)+ &
-                    parcel1%mbin_temp(i,parcel1%n_comps+1)*parcel1%npart_temp(i))/nnew
-            endif
-        enddo
-        parcel1%moments(1:n,:)=parcel1%moments(1:n,:)+parcel1%moments_temp(1:n,:)
-        parcel1%npart=parcel1%npart+parcel1%npart_temp
-
-        do i=1,n
-            if (parcel1%npart(i).le.tiny(1._wp)) cycle
-            do j=1,parcel1%n_comps
-                parcel1%mbin(i,j)=parcel1%moments(i,j)/parcel1%npart(i)
+        if (parcel1%bin_scheme_flag.eq.BIN_FULL_MOVING) then
+            ! Released aerosol is returned according to
+            ! full_moving_release_mode: same source index by default, or the
+            ! original water-coordinate split representation.  Dry residuals
+            ! remain distinct populations; if the mode is full, the closest
+            ! existing water-mass pair is compacted conservatively to free a slot.
+            ! This applies equally to liquid evaporation and complete ice
+            ! sublimation and transports all prognostic moments unchanged.
+            call merge_full_moving_warm_source( &
+                parcel1%npart_temp, &
+                parcel1%mbin_temp(:,parcel1%n_comps+1), &
+                parcel1%moments_temp(1:n,:))
+        else
+            ! Fixed-grid residuals have already been projected onto their
+            ! destination intervals by prepare_released_hydrometeor_aerosol().
+            ! For Chen-Lamb in particular, the temporary LIQUID residual has
+            ! already undergone the conservative finite-width m**(1/3) remap.
+            ! Merge by adding zeroth/first moments in each fixed interval.
+            do i=1,n
+                nnew=parcel1%npart(i)+parcel1%npart_temp(i)
+                if (nnew.gt.tiny(1._wp)) then
+                    parcel1%y(i)=(parcel1%y(i)*parcel1%npart(i)+ &
+                        parcel1%mbin_temp(i,parcel1%n_comps+1)* &
+                        parcel1%npart_temp(i))/nnew
+                endif
             enddo
-            parcel1%mbin(i,parcel1%n_comps+1)=parcel1%y(i)
-        enddo
+            parcel1%moments(1:n,:)=parcel1%moments(1:n,:)+ &
+                parcel1%moments_temp(1:n,:)
+            parcel1%npart=parcel1%npart+parcel1%npart_temp
 
-        if (parcel1%bin_scheme_flag.ne.BIN_FULL_MOVING) then
-            call moving_centre(parcel1%n_bin_mode,parcel1%n_bin_modew, &
-                parcel1%n_bins1,parcel1%n_modes,parcel1%n_comps, &
-                parcel1%imoms+parcel1%n_comps,parcel1%npart, &
-                parcel1%y(1:n),parcel1%moments(1:n,:),parcel1%mbin, &
-                parcel1%mbinedges)
+            do i=1,n
+                if (parcel1%npart(i).le.tiny(1._wp)) cycle
+                do j=1,parcel1%n_comps
+                    parcel1%mbin(i,j)=parcel1%moments(i,j)/parcel1%npart(i)
+                enddo
+                parcel1%mbin(i,parcel1%n_comps+1)=parcel1%y(i)
+            enddo
+
+            if (parcel1%bin_scheme_flag.eq.BIN_MOVING_CENTRE) then
+                ! The generic moving-centre scheme still needs its normal
+                ! consolidation pass.  Do NOT run this for BIN_CHEN_LAMB: that
+                ! would undo the conservative Chen-Lamb release remapping.
+                call moving_centre(parcel1%n_bin_mode,parcel1%n_bin_modew, &
+                    parcel1%n_bins1,parcel1%n_modes,parcel1%n_comps, &
+                    parcel1%imoms+parcel1%n_comps,parcel1%npart, &
+                    parcel1%y(1:n),parcel1%moments(1:n,:),parcel1%mbin, &
+                    parcel1%mbinedges)
+            endif
         endif
 
         parcel1%npart_temp=0._wp
@@ -8698,30 +9652,537 @@
 
 
     ! ============================================================================
+    ! chamber_dry_air_mass
+    ! ============================================================================
+    !>@brief
+    !>Returns the instantaneous dry-air mass in the cylindrical chamber [kg].
+    !>The wall reservoir is stored as a physical mass, while BMM water variables
+    !>are mixing ratios per kg dry air, so this conversion is required whenever
+    !>water crosses the wall.  Vapour pressure is inferred consistently from qv.
+    real(wp) function chamber_dry_air_mass(p,t,qv) result(mdry)
+        implicit none
+        real(wp), intent(in) :: p,t,qv
+        real(wp) :: radius,volume,e,pdry,rhodry,qvp
+
+        if (chamber_diameter.le.0._wp .or. chamber_height.le.0._wp) error stop &
+            'Positive chamber dimensions required to calculate wall-water reservoir mass'
+        if (p.le.0._wp .or. t.le.150._wp) error stop &
+            'Unphysical chamber thermodynamics in chamber_dry_air_mass'
+
+        radius=0.5_wp*chamber_diameter
+        volume=pi*radius**2*chamber_height
+        qvp=max(qv,0._wp)
+        e=p*qvp/max(eps1+qvp,tiny(1._wp))
+        pdry=max(p-e,0._wp)
+        rhodry=pdry/(ra*t)
+        mdry=rhodry*volume
+        if (mdry.le.tiny(1._wp)) error stop &
+            'Non-positive chamber dry-air mass in wall-water exchange'
+    end function chamber_dry_air_mass
+
+
+    ! ============================================================================
+    ! chamber_wall_area
+    ! ============================================================================
+    !>@brief
+    !>Returns the internal chamber surface area available for vapour exchange
+    !>[m2].  Vapour deposition/evaporation is not gravitational fallout, so the
+    !>side wall, ceiling and floor are all included.  Hydrometeor floor fallout
+    !>remains a separate particle process and is therefore not double counted.
+    real(wp) function chamber_wall_area() result(area)
+        implicit none
+        real(wp) :: radius
+
+        if (chamber_diameter.le.0._wp .or. chamber_height.le.0._wp) error stop &
+            'Positive chamber dimensions required to calculate wall area'
+        radius=0.5_wp*chamber_diameter
+        area=2._wp*pi*radius*chamber_height+2._wp*pi*radius**2
+    end function chamber_wall_area
+
+
+    ! ============================================================================
+    ! diagnose_chamber_wall_water_exchange
+    ! ============================================================================
+    !>@brief
+    !>Diagnoses wall-vapour exchange using a finite prognostic wall-water
+    !>reservoir.  The wall starts dry by default; therefore subsaturated air
+    !>cannot receive water unless the wall has accumulated condensate/frost.
+    !>
+    !>At Twall >= 0 C the active wall phase is liquid and equilibrium is with
+    !>respect to liquid water.  At Twall < 0 C the active phase is ice/frost and
+    !>equilibrium is with respect to ice.  Stored wall water is transferred
+    !>between the liquid and ice reservoirs when Twall crosses 0 C.  Because
+    !>Twall is measured/prescribed, the associated latent heat is assigned to
+    !>the wall boundary condition rather than perturbing the chamber temperature.
+    !>
+    !>For the fraction of chamber air visiting the BL during this substep,
+    !>chamber_wall_water_efficiency relaxes vapour toward wall equilibrium.
+    !>Condensation/deposition is limited by available airborne vapour; wall
+    !>evaporation/sublimation is additionally limited by the stored reservoir.
+    !>The returned component fluxes are chamber-mean mixing-ratio changes:
+    !>positive = wall -> air, negative = air -> wall.
+    subroutine diagnose_chamber_wall_water_exchange(twall,tgas,qv,p,fmix, &
+        dqv_liq,dqv_ice,qv_after_wall)
+        implicit none
+        real(wp), intent(in) :: twall,tgas,qv,p,fmix
+        real(wp), intent(out) :: dqv_liq,dqv_ice,qv_after_wall
+        real(wp) :: es,qeq,eff,dq_local,dq_desired,dq_actual,mdry,available_q, &
+            wall_before,wall_after,wall_expected
+
+        if (twall.le.150._wp .or. twall.ge.400._wp) error stop &
+            'Unphysical wall temperature in chamber wall-water exchange'
+
+        wall_before=parcel1%chamber_wall_liquid_water+parcel1%chamber_wall_ice_water
+
+        ! Treat newly stored wall water as the stable bulk phase at the measured
+        ! wall temperature.  This is a chamber-surface reservoir, not airborne
+        ! hydrometeor microphysics, so no supercooled wall-liquid state is kept.
+        if (twall.ge.ttr) then
+            parcel1%chamber_wall_liquid_water=parcel1%chamber_wall_liquid_water+ &
+                parcel1%chamber_wall_ice_water
+            parcel1%chamber_wall_ice_water=0._wp
+            es=svp_liq(twall)
+        else
+            parcel1%chamber_wall_ice_water=parcel1%chamber_wall_ice_water+ &
+                parcel1%chamber_wall_liquid_water
+            parcel1%chamber_wall_liquid_water=0._wp
+            es=svp_ice(twall)
+        endif
+
+        qeq=eps1*es/max(p-es,tiny(1._wp))
+        eff=max(0._wp,min(chamber_wall_water_efficiency,1._wp))
+        dq_local=eff*(qeq-max(qv,0._wp))
+        dq_desired=max(0._wp,min(fmix,1._wp))*dq_local
+        mdry=chamber_dry_air_mass(p,tgas,qv)
+
+        ! A negative desired change is deposition/condensation and can create a
+        ! reservoir on an initially dry wall.  A positive desired change is a
+        ! source and is capped by water actually stored on the active wall phase.
+        if (dq_desired.le.0._wp) then
+            dq_actual=max(dq_desired,-max(qv,0._wp))
+        elseif (twall.ge.ttr) then
+            available_q=parcel1%chamber_wall_liquid_water/mdry
+            dq_actual=min(dq_desired,max(available_q,0._wp))
+        else
+            available_q=parcel1%chamber_wall_ice_water/mdry
+            dq_actual=min(dq_desired,max(available_q,0._wp))
+        endif
+
+        dqv_liq=0._wp
+        dqv_ice=0._wp
+        if (twall.ge.ttr) then
+            dqv_liq=dq_actual
+            parcel1%chamber_wall_liquid_water=max( &
+                parcel1%chamber_wall_liquid_water-dq_actual*mdry,0._wp)
+        else
+            dqv_ice=dq_actual
+            parcel1%chamber_wall_ice_water=max( &
+                parcel1%chamber_wall_ice_water-dq_actual*mdry,0._wp)
+        endif
+
+        ! Particle evaporation is diagnosed for the processed BL parcel rather
+        ! than the chamber mean.  Undo the fmix weighting here so that the local
+        ! BL humidity is consistent with the actual reservoir-limited wall flux.
+        if (fmix.gt.tiny(1._wp)) then
+            qv_after_wall=max(qv+dq_actual/fmix,0._wp)
+        else
+            qv_after_wall=max(qv,0._wp)
+        endif
+
+        if (parcel1%chamber_wall_liquid_water.lt.-1.e-12_wp .or. &
+            parcel1%chamber_wall_ice_water.lt.-1.e-12_wp) error stop &
+            'Negative chamber wall-water reservoir after exchange'
+        wall_after=parcel1%chamber_wall_liquid_water+parcel1%chamber_wall_ice_water
+        wall_expected=wall_before-dq_actual*mdry
+        if (abs(wall_after-wall_expected).gt.max(1.e-12_wp, &
+            1.e-10_wp*max(abs(wall_expected),1.e-12_wp))) error stop &
+            'Chamber wall-water reservoir mass consistency check failed'
+    end subroutine diagnose_chamber_wall_water_exchange
+
+
+    ! ============================================================================
+    ! diagnose_chamber_wall_mass_transfer
+    ! ============================================================================
+    !>@brief
+    !>Physical finite-rate vapour transfer between chamber air and the measured
+    !>wall temperature.  Unlike mode 1, this closure does not relax a prescribed
+    !>fraction of BL air toward saturation and therefore does not use fmix or
+    !>chamber_bl_tau to determine the vapour-wall flux.
+    !>
+    !>The area-mean vapour mass flux is
+    !>
+    !>  Jv = km * (e_eq(Twall)-e_air) / (Rv*Tgas)                 [kg m-2 s-1]
+    !>
+    !>where km=chamber_wall_vapour_transfer_velocity [m s-1].
+    !>Using the same gas reference temperature on both concentration terms
+    !>ensures that the flux is exactly zero when e_air=e_eq(Twall), i.e. when
+    !>RH with respect to the wall is one.
+    !>
+    !>Positive Jv is wall -> air (evaporation/sublimation); negative Jv is
+    !>air -> wall (condensation/deposition).  A dry wall may always acquire
+    !>water, whereas a positive wall source is capped by the prognostic wall
+    !>reservoir.  The wall reservoir remains a physical mass [kg].
+    !>
+    !>This routine applies the physical wall flux to the chamber-mean vapour
+    !>budget.  qv_after_wall is therefore the chamber-mean humidity after that
+    !>flux.  The humidity experienced locally by the fmix fraction of particles
+    !>that actually visits the BL is diagnosed separately by the caller from
+    !>dq_wall/fmix, with a no-overshoot bound at wall equilibrium.
+    subroutine diagnose_chamber_wall_mass_transfer(twall,tgas,qv,p,dtwall, &
+        dqv_liq,dqv_ice,qv_after_wall)
+        implicit none
+        real(wp), intent(in) :: twall,tgas,qv,p,dtwall
+        real(wp), intent(out) :: dqv_liq,dqv_ice,qv_after_wall
+        real(wp) :: es,eair,km,rho_drive,jv,area,mdry,dq_desired,dq_actual, &
+            available_q,wall_before,wall_after,wall_expected
+
+        if (twall.le.150._wp .or. twall.ge.400._wp) error stop &
+            'Unphysical wall temperature in chamber wall mass transfer'
+        if (dtwall.le.0._wp) error stop &
+            'Non-positive timestep in chamber wall mass transfer'
+
+        wall_before=parcel1%chamber_wall_liquid_water+parcel1%chamber_wall_ice_water
+
+        ! Keep the stored wall phase consistent with the prescribed wall
+        ! temperature.  Latent heat associated with wall freezing/melting is
+        ! assigned to the measured wall boundary condition.
+        if (twall.ge.ttr) then
+            parcel1%chamber_wall_liquid_water=parcel1%chamber_wall_liquid_water+ &
+                parcel1%chamber_wall_ice_water
+            parcel1%chamber_wall_ice_water=0._wp
+            es=svp_liq(twall)
+        else
+            parcel1%chamber_wall_ice_water=parcel1%chamber_wall_ice_water+ &
+                parcel1%chamber_wall_liquid_water
+            parcel1%chamber_wall_liquid_water=0._wp
+            es=svp_ice(twall)
+        endif
+
+        eair=p*max(qv,0._wp)/max(eps1+max(qv,0._wp),tiny(1._wp))
+        parcel1%chamber_wall_rh=eair/max(es,tiny(1._wp))
+
+        km=max(chamber_wall_vapour_transfer_velocity,0._wp)
+        rho_drive=(es-eair)/(rv*max(tgas,150._wp))
+        jv=km*rho_drive
+        area=chamber_wall_area()
+        mdry=chamber_dry_air_mass(p,tgas,qv)
+
+        ! Convert the physical wall mass transfer over this substep into the
+        ! BMM water-mixing-ratio convention [kg water per kg dry air].
+        dq_desired=jv*area*dtwall/mdry
+
+        if (dq_desired.le.0._wp) then
+            ! Deposition/condensation is limited only by airborne vapour.
+            dq_actual=max(dq_desired,-max(qv,0._wp))
+        elseif (twall.ge.ttr) then
+            available_q=parcel1%chamber_wall_liquid_water/mdry
+            dq_actual=min(dq_desired,max(available_q,0._wp))
+        else
+            available_q=parcel1%chamber_wall_ice_water/mdry
+            dq_actual=min(dq_desired,max(available_q,0._wp))
+        endif
+
+        dqv_liq=0._wp
+        dqv_ice=0._wp
+        if (twall.ge.ttr) then
+            dqv_liq=dq_actual
+            parcel1%chamber_wall_liquid_water=max( &
+                parcel1%chamber_wall_liquid_water-dq_actual*mdry,0._wp)
+        else
+            dqv_ice=dq_actual
+            parcel1%chamber_wall_ice_water=max( &
+                parcel1%chamber_wall_ice_water-dq_actual*mdry,0._wp)
+        endif
+
+        ! Store the actual (possibly reservoir-limited) signed area-mean flux.
+        parcel1%chamber_wall_vapour_flux=dq_actual*mdry/(area*dtwall)
+        qv_after_wall=max(qv+dq_actual,0._wp)
+
+        wall_after=parcel1%chamber_wall_liquid_water+parcel1%chamber_wall_ice_water
+        wall_expected=wall_before-dq_actual*mdry
+        if (abs(wall_after-wall_expected).gt.max(1.e-12_wp, &
+            1.e-10_wp*max(abs(wall_expected),1.e-12_wp))) error stop &
+            'Chamber physical wall mass-transfer reservoir consistency check failed'
+    end subroutine diagnose_chamber_wall_mass_transfer
+
+
+    ! ============================================================================
+    ! diagnose_coupled_chamber_wall_evaporation
+    ! ============================================================================
+    !>@brief
+    !>Couples physical finite-rate wall vapour transfer to evaporation of the
+    !>particles that actually visit the chamber boundary layer.
+    !>
+    !>The wall flux is a chamber-mean external water tendency, but it is driven
+    !>by the humidity of the locally processed BL air.  Particle evaporation
+    !>adds vapour to that same local air, so the wall is allowed to remove
+    !>vapour generated by particle evaporation during the *same* BL encounter.
+    !>
+    !>A fixed-point iteration is used:
+    !>  (1) calculate Jv from the current local BL humidity;
+    !>  (2) convert Jv*A*dt/Mdry to the chamber-mean wall-water increment;
+    !>  (3) convert that to the local processed-air humidity change by /fmix;
+    !>  (4) diagnose liquid evaporation and latent cooling in that local air;
+    !>  (5) use the resulting local vapour as the next wall-flux driving state.
+    !>
+    !>The prognostic wall reservoir is *not* modified during the iteration.
+    !>Once converged, the final wall transfer is committed exactly once.
+    !>
+    !>Signs follow the existing convention: dq_wall > 0 is wall -> air,
+    !>dq_wall < 0 is air -> wall.  Positive wall sources are capped by the
+    !>available prognostic liquid/frost reservoir.  Deposition is allowed onto
+    !>an initially dry wall.
+    subroutine diagnose_coupled_chamber_wall_evaporation(twall,tgas,tsens,qv0, &
+        ql_available,p,dtwall,fmix,dqv_liq,dqv_ice,qv_wall_local,tbl,qv_bl, &
+        dq_evap_local)
+        implicit none
+        real(wp), intent(in) :: twall,tgas,tsens,qv0,ql_available,p,dtwall,fmix
+        real(wp), intent(out) :: dqv_liq,dqv_ice,qv_wall_local,tbl,qv_bl, &
+            dq_evap_local
+        integer(i4b) :: iter
+        logical :: converged
+        real(wp) :: es,eair,km,rho_drive,jv,area,mdry,dq_desired,dq_wall, &
+            dq_old,dq_evap_old,available_q,qv_drive,qv_eq,dq_equil,wall_before, &
+            wall_after,wall_expected,tolq,tol_local
+
+        if (twall.le.150._wp .or. twall.ge.400._wp) error stop &
+            'Unphysical wall temperature in coupled chamber wall evaporation'
+        if (dtwall.le.0._wp) error stop &
+            'Non-positive timestep in coupled chamber wall evaporation'
+        if (fmix.le.tiny(1._wp)) then
+            dqv_liq=0._wp
+            dqv_ice=0._wp
+            qv_wall_local=max(qv0,0._wp)
+            tbl=tsens
+            qv_bl=max(qv0,0._wp)
+            dq_evap_local=0._wp
+            return
+        endif
+
+        wall_before=parcel1%chamber_wall_liquid_water+ &
+            parcel1%chamber_wall_ice_water
+
+        ! The wall phase follows the prescribed measured wall temperature.
+        ! Phase conversion of stored wall water is assigned to the wall thermal
+        ! reservoir and therefore does not alter the chamber-air water budget.
+        if (twall.ge.ttr) then
+            parcel1%chamber_wall_liquid_water= &
+                parcel1%chamber_wall_liquid_water+parcel1%chamber_wall_ice_water
+            parcel1%chamber_wall_ice_water=0._wp
+            es=svp_liq(twall)
+        else
+            parcel1%chamber_wall_ice_water= &
+                parcel1%chamber_wall_ice_water+parcel1%chamber_wall_liquid_water
+            parcel1%chamber_wall_liquid_water=0._wp
+            es=svp_ice(twall)
+        endif
+
+        qv_eq=eps1*es/max(p-es,tiny(1._wp))
+        km=max(chamber_wall_vapour_transfer_velocity,0._wp)
+        area=chamber_wall_area()
+        mdry=chamber_dry_air_mass(p,tgas,qv0)
+
+        ! Start from the incoming chamber humidity.  qv_drive is subsequently
+        ! replaced by the local post-evaporation BL humidity.
+        qv_drive=max(qv0,0._wp)
+        dq_old=huge(1._wp)
+        dq_evap_old=huge(1._wp)
+        dq_wall=0._wp
+        dq_evap_local=0._wp
+        qv_wall_local=qv_drive
+        tbl=tsens
+        qv_bl=qv_drive
+        converged=.false.
+
+        do iter=1,80
+            eair=p*max(qv_drive,0._wp)/ &
+                max(eps1+max(qv_drive,0._wp),tiny(1._wp))
+            rho_drive=(es-eair)/(rv*max(tgas,150._wp))
+            jv=km*rho_drive
+            dq_desired=jv*area*dtwall/mdry
+
+            ! Limit the ACTUAL wall transfer rather than clipping the local
+            ! humidity afterwards.  qv_drive is the current fixed-point estimate
+            ! of the post-evaporation BL humidity, so
+            !
+            !   dq_equil = fmix*(qv_eq-qv_drive)
+            !
+            ! is the chamber-mean transfer that would bring the processed air
+            ! exactly to wall equilibrium.  This allows vapour generated by
+            ! particle evaporation to contribute to deposition while preventing
+            ! a finite wall-transfer step from crossing equilibrium.
+            dq_equil=fmix*(qv_eq-qv_drive)
+
+            if (dq_desired.gt.0._wp) then
+                ! Wall source: bounded both by wall equilibrium and by the
+                ! finite prognostic liquid/frost reservoir.
+                if (twall.ge.ttr) then
+                    available_q=parcel1%chamber_wall_liquid_water/mdry
+                else
+                    available_q=parcel1%chamber_wall_ice_water/mdry
+                endif
+                dq_wall=min(dq_desired,max(dq_equil,0._wp), &
+                    max(available_q,0._wp))
+            else
+                ! Wall sink: do not cross wall equilibrium.  The additional
+                ! qv0 bound keeps the explicitly reconstructed pre-evaporation
+                ! local humidity non-negative.
+                dq_wall=max(dq_desired,min(dq_equil,0._wp), &
+                    -fmix*max(qv0,0._wp))
+            endif
+
+            ! This relation is now exact: no after-the-fact RH clipping is used.
+            qv_wall_local=qv0+dq_wall/fmix
+            if (qv_wall_local.lt.-1.e-14_wp) error stop &
+                'Negative local BL humidity in coupled wall evaporation'
+            qv_wall_local=max(qv_wall_local,0._wp)
+
+            call diagnose_chamber_bl_evaporation_state(tsens,qv_wall_local, &
+                ql_available,p,tbl,qv_bl,dq_evap_local)
+
+            tolq=max(1.e-14_wp,1.e-8_wp*max(abs(dq_wall), &
+                abs(fmix*dq_evap_local),1.e-12_wp))
+            tol_local=max(1.e-14_wp,1.e-8_wp*max(abs(qv_bl), &
+                abs(qv_drive),1.e-12_wp))
+            if (abs(dq_wall-dq_old).le.tolq .and. &
+                abs(dq_evap_local-dq_evap_old).le. &
+                max(1.e-14_wp,1.e-8_wp*max(abs(dq_evap_local),1.e-12_wp)) .and. &
+                abs(qv_bl-qv_drive).le.tol_local) then
+                converged=.true.
+                exit
+            endif
+
+            ! Under-relax the wall-driving humidity to make the coupling robust
+            ! when evaporation and deposition strongly oppose one another.
+            qv_drive=0.5_wp*qv_drive+0.5_wp*max(qv_bl,0._wp)
+            dq_old=dq_wall
+            dq_evap_old=dq_evap_local
+        enddo
+
+        if (.not.converged) then
+            write(*,*) 'Coupled chamber wall/evaporation solve did not converge'
+            write(*,*) 'iterations, fmix, km = ',iter,fmix,km
+            write(*,*) 'qv0, qv_drive, qv_bl, qv_eq = ', &
+                qv0,qv_drive,qv_bl,qv_eq
+            write(*,*) 'dq_wall, dq_evap_local = ',dq_wall,dq_evap_local
+            error stop 'Non-converged coupled chamber wall evaporation'
+        endif
+
+        ! Commit the converged wall transfer exactly once.
+        dqv_liq=0._wp
+        dqv_ice=0._wp
+        if (twall.ge.ttr) then
+            dqv_liq=dq_wall
+            parcel1%chamber_wall_liquid_water=max( &
+                parcel1%chamber_wall_liquid_water-dq_wall*mdry,0._wp)
+        else
+            dqv_ice=dq_wall
+            parcel1%chamber_wall_ice_water=max( &
+                parcel1%chamber_wall_ice_water-dq_wall*mdry,0._wp)
+        endif
+
+        eair=p*max(qv_bl,0._wp)/max(eps1+max(qv_bl,0._wp),tiny(1._wp))
+        parcel1%chamber_wall_rh=eair/max(es,tiny(1._wp))
+        parcel1%chamber_wall_vapour_flux=dq_wall*mdry/(area*dtwall)
+
+        wall_after=parcel1%chamber_wall_liquid_water+ &
+            parcel1%chamber_wall_ice_water
+        wall_expected=wall_before-dq_wall*mdry
+        if (abs(wall_after-wall_expected).gt.max(1.e-12_wp, &
+            1.e-10_wp*max(abs(wall_expected),1.e-12_wp))) error stop &
+            'Coupled chamber wall-water reservoir consistency check failed'
+    end subroutine diagnose_coupled_chamber_wall_evaporation
+
+
+    ! ============================================================================
+    ! diagnose_chamber_bl_evaporation_state
+    ! ============================================================================
+    !>@brief
+    !>Diagnoses liquid evaporation in a BL parcel after any finite wall-water
+    !>exchange has been applied.  Unlike the legacy coupled BL closure, this
+    !>routine never imposes an additional instantaneous wall-condensation cap.
+    !>If the parcel is subsaturated at T_sens it solves liquid evaporation and
+    !>latent cooling to liquid saturation, capped by the available liquid.
+    !>Residual supersaturation is retained and returned to the chamber, where
+    !>the normal microphysics can respond after remixing.
+    subroutine diagnose_chamber_bl_evaporation_state(tsens,qv,ql_available,p, &
+        tbl,qv_bl,dq_evap_local)
+        implicit none
+        real(wp), intent(in) :: tsens,qv,ql_available,p
+        real(wp), intent(out) :: tbl,qv_bl,dq_evap_local
+        integer(i4b) :: iter
+        real(wp) :: cpm,qvs,lo,hi,mid,ttry,qtry,res
+
+        tbl=tsens
+        qv_bl=max(qv,0._wp)
+        dq_evap_local=0._wp
+        cpm=max(cp+max(qv,0._wp)*cpv+max(ql_available,0._wp)*cpw,0.5_wp*cp)
+        qvs=eps1*svp_liq(tsens)/max(p-svp_liq(tsens),tiny(1._wp))
+
+        if (qv.lt.qvs .and. ql_available.gt.tiny(1._wp)) then
+            lo=0._wp
+            hi=max(ql_available,0._wp)
+            mid=0._wp
+            ttry=tsens-lv*hi/cpm
+            qtry=qv+hi
+            qvs=eps1*svp_liq(ttry)/max(p-svp_liq(ttry),tiny(1._wp))
+            if (qtry.lt.qvs) then
+                mid=hi
+            else
+                do iter=1,80
+                    mid=0.5_wp*(lo+hi)
+                    ttry=tsens-lv*mid/cpm
+                    qtry=qv+mid
+                    qvs=eps1*svp_liq(ttry)/max(p-svp_liq(ttry),tiny(1._wp))
+                    res=qtry-qvs
+                    if (abs(res).le.1.e-12_wp) exit
+                    if (res.lt.0._wp) then
+                        lo=mid
+                    else
+                        hi=mid
+                    endif
+                enddo
+            endif
+            dq_evap_local=max(0._wp,min(mid,ql_available))
+            tbl=tsens-lv*dq_evap_local/cpm
+            qv_bl=qv+dq_evap_local
+        endif
+
+        if (tbl.le.150._wp .or. tbl.ge.400._wp) error stop &
+            'Unphysical temperature in chamber BL evaporation thermodynamics'
+    end subroutine diagnose_chamber_bl_evaporation_state
+
+
+    ! ============================================================================
     ! apply_chamber_bl_homogeneous_evaporation
     ! ============================================================================
     !>@brief
-    !>Applies homogeneous diffusional evaporation to all currently activated
-    !>warm particles for a prescribed chamber-mean liquid-water target.
+    !>Represents the prescribed chamber-mean BL liquid-water loss by reducing
+    !>particle liquid-water mass while retaining particle number.
     !>
-    !>Homogeneous here means every wet warm particle experiences the same D^2
-    !>decrement.  Since liquid-water mass m_w is proportional to D_w^3, the
-    !>finite D^2-law mapping can be written
+    !>The same chamber_bl_evap_size_exp=p used by the inhomogeneous scheme sets
+    !>the size dependence.  For p>0 a common decrement is applied in transformed
+    !>liquid-water mass
     !>
-    !>  m_w,new = [max(m_w,old^(2/3) - ds, 0)]^(3/2),
+    !>    s = m_w^(p/3)
+    !>    s_new = max(s_old-ds,0)
+    !>    m_w,new = s_new^(3/p).
     !>
-    !>with one common ds for all wet warm bins.  ds is solved by bisection so
-    !>that sum_i N_i (m_w,old-m_w,new) equals dq_target, limited only by the
-    !>available warm liquid.  Small droplets may therefore evaporate
-    !>completely naturally under the common D^2 exposure; larger droplets
-    !>shrink but retain their number.  The ordinary moving-bin remapping is
-    !>applied afterwards so all carried extensive moments remain consistent.
+    !>Thus p=2 is exactly the familiar common finite D^2 decrement because
+    !>m_w^(2/3) is proportional to D_w^2.  The p=0 limit is defined as an equal
+    !>fractional liquid-mass reduction in every wet warm population, giving a
+    !>size-neutral homogeneous counterpart to uniform inhomogeneous removal.
+    !>
+    !>All warm populations carrying liquid water participate, irrespective of
+    !>activation state.  ds (or the p=0 fractional reduction) is chosen so the
+    !>net liquid-water loss equals dq_target to numerical precision.
     subroutine apply_chamber_bl_homogeneous_evaporation(dq_target,dq_actual)
         implicit none
         real(wp), intent(in) :: dq_target
         real(wp), intent(out) :: dq_actual
         integer(i4b) :: i,n,iter
-        real(wp) :: qavail,lo,hi,mid,qmid,sold,snew
+        real(wp) :: qavail,lo,hi,mid,qmid,sold,snew,alpha,inv_alpha, &
+            target,frac_uniform
         logical, allocatable :: active(:)
         real(wp), allocatable :: mold(:),mnew(:)
 
@@ -8735,67 +10196,73 @@
         active=.false.
 
         qavail=0._wp
-        hi=0._wp
         do i=1,n
             if (parcel1%npart(i).le.tiny(1._wp)) cycle
             if (mold(i).le.tiny(1._wp)) cycle
             active(i)=.true.
             qavail=qavail+parcel1%npart(i)*mold(i)
-            hi=max(hi,mold(i)**twothirds)
         enddo
         if (qavail.le.tiny(1._wp)) then
             deallocate(mold,mnew,active)
             return
         endif
 
-        ! Complete evaporation of all warm liquid is the natural upper
-        ! bound.  If the thermodynamic target exceeds this reservoir, use all
-        ! available liquid rather than manufacturing water.
-        if (dq_target.ge.qavail*(1._wp-1.e-12_wp)) then
+        target=min(max(dq_target,0._wp),qavail)
+
+        if (target.ge.qavail*(1._wp-1.e-12_wp)) then
             do i=1,n
                 if (active(i)) mnew(i)=0._wp
             enddo
+
+        elseif (chamber_bl_evap_size_exp.le.tiny(1._wp)) then
+            ! p=0: no size preference.  Every wet population loses the same
+            ! fraction of its liquid mass while number is retained.
+            frac_uniform=target/qavail
+            do i=1,n
+                if (active(i)) mnew(i)=mold(i)*(1._wp-frac_uniform)
+            enddo
+
         else
+            alpha=chamber_bl_evap_size_exp/3._wp
+            inv_alpha=1._wp/alpha
             lo=0._wp
+            hi=0._wp
+            do i=1,n
+                if (active(i)) hi=max(hi,mold(i)**alpha)
+            enddo
+
             do iter=1,80
                 mid=0.5_wp*(lo+hi)
                 qmid=0._wp
                 do i=1,n
                     if (.not.active(i)) cycle
-                    sold=mold(i)**twothirds
+                    sold=mold(i)**alpha
                     snew=max(sold-mid,0._wp)
-                    qmid=qmid+parcel1%npart(i)*(mold(i)-snew**1.5_wp)
+                    qmid=qmid+parcel1%npart(i)*(mold(i)-snew**inv_alpha)
                 enddo
-                if (abs(qmid-dq_target).le.max(1.e-14_wp,1.e-10_wp*dq_target)) exit
-                if (qmid.lt.dq_target) then
+                if (abs(qmid-target).le.max(1.e-14_wp,1.e-10_wp*target)) exit
+                if (qmid.lt.target) then
                     lo=mid
                 else
                     hi=mid
                 endif
             enddo
+
             do i=1,n
                 if (.not.active(i)) cycle
-                sold=mold(i)**twothirds
+                sold=mold(i)**alpha
                 snew=max(sold-mid,0._wp)
-                mnew(i)=snew**1.5_wp
+                mnew(i)=snew**inv_alpha
             enddo
         endif
 
         dq_actual=sum(parcel1%npart*max(mold-mnew,0._wp))
 
-        ! Remap the post-evaporation masses first.  apply_growth_bin_scheme may
-        ! move number/moments between fixed bins and, crucially, it updates the
-        ! representative mass vector mnew to the remapped destination means.
-        !
-        ! Do NOT copy the pre-remap mnew into parcel1%y and then leave it there:
-        ! that makes y inconsistent with npart/moments/mbin after Chen-Lamb
-        ! transfer and can present DVODE with an occupied bin carrying the wrong
-        ! (often extremely small) water mass on the next timestep.
+        ! The homogeneous representation changes liquid mass/size but not
+        ! particle number.  Existing bin-scheme remapping then conserves all
+        ! carried extensive moments while synchronising representative masses.
         call apply_growth_bin_scheme(parcel1%npart,mold,mnew, &
             parcel1%moments(1:n,:),parcel1%mbin)
-
-        ! Synchronize the prognostic ODE masses with the REMAPPED representative
-        ! masses returned in mnew.
         parcel1%y(1:n)=mnew
 
         if (parcel1%ice_flag.eq.1) then
@@ -8809,82 +10276,175 @@
         deallocate(mold,mnew,active)
     end subroutine apply_chamber_bl_homogeneous_evaporation
 
-
     ! ============================================================================
-    ! chamber_bl_d2_target_fractions
+    ! chamber_bl_residual_water_masses
     ! ============================================================================
     !>@brief
-    !>Constructs D2-law-weighted complete-evaporation fractions for a prescribed
-    !>gross liquid-water removal target.  Fractions scale as m_w^(-2/3), are
-    !>capped by fmax (the fraction of chamber air that visited the BL this
-    !>timestep), and a single coefficient is solved by bisection.  This retains
-    !>the previous size-selective extreme-inhomogeneous idea while separating it
-    !>from the new wall thermodynamics.
-    subroutine chamber_bl_d2_target_fractions(dq_target,fmax,fracliq)
+    !>Returns the liquid-water mass carried by the aerosol residual immediately
+    !>after a particle selected for COMPLETE inhomogeneous evaporation.
+    !>
+    !>For the chamber-BL complete-evaporation representation this is identically
+    !>zero.  The non-volatile aerosol components are retained and returned to the
+    !>warm grid, but no equilibrium haze water is added during the same BL
+    !>operator.  Subsequent normal condensational growth is responsible for
+    !>rehydrating the residual after it has remixed into the chamber.
+    !>
+    !>This is essential for representation invariance: the thermodynamic BL
+    !>solver prescribes a NET liquid-water loss dq_target.  In homogeneous mode
+    !>that water is removed by shrinking particles; in inhomogeneous mode it is
+    !>removed by taking complete wet particles to dry aerosol residuals.
+    subroutine chamber_bl_residual_water_masses(t_resid,rh_resid,mresid)
         implicit none
-        real(wp), intent(in) :: dq_target,fmax
-        real(wp), dimension(:), intent(out) :: fracliq
-        integer(i4b) :: i,iter,n
-        real(wp) :: mmin,mw,lo,hi,mid,qmid,weight
+        real(wp), intent(in) :: t_resid,rh_resid
+        real(wp), dimension(:), intent(out) :: mresid
+        integer(i4b) :: n
 
         n=parcel1%n_bin_modew
-        if (size(fracliq).ne.n) error stop &
-            'fracliq has wrong size in chamber_bl_d2_target_fractions'
+        if (size(mresid).ne.n) error stop &
+            'mresid has wrong size in chamber_bl_residual_water_masses'
+
+        ! t_resid and rh_resid are intentionally retained in the interface for
+        ! clarity and possible future diagnostics, but complete BL evaporation
+        ! returns the aerosol residual dry at this instant.
+        mresid=0._wp
+    end subroutine chamber_bl_residual_water_masses
+
+    ! ============================================================================
+    ! chamber_bl_inhom_target_fractions
+    ! ============================================================================
+    !>@brief
+    !>Constructs complete-particle evaporation fractions for a prescribed NET
+    !>chamber-mean liquid-water loss.
+    !>
+    !>All wet warm populations may respond to the wall-conditioned AIR mixed
+    !>into the chamber.  `fmix` has already acted upstream in the thermodynamic
+    !>target
+    !>
+    !>    dq_target = fmix * dq_evap_local
+    !>
+    !>and is therefore NOT reused here as a particle-exposure cap.
+    !>
+    !>The common evaporation size exponent p=chamber_bl_evap_size_exp gives
+    !>
+    !>    weight_i = (mref/mw_i)^(p/3).
+    !>
+    !>p=0 removes the same NUMBER fraction from every wet population.  p=2 gives
+    !>the inverse-D^2 liquid-water-equivalent lifetime weighting.  Survivors
+    !>retain their representative size.
+    !>
+    !>The bisection targets the NET liquid-water loss
+    !>
+    !>    sum_i f_i N_i (mw_i-mresid_i) = dq_target
+    !>
+    !>with the only binwise bound 0<=f_i<=1.
+    subroutine chamber_bl_inhom_target_fractions(dq_target,mresid,fracliq)
+        implicit none
+        real(wp), intent(in) :: dq_target
+        real(wp), dimension(:), intent(in) :: mresid
+        real(wp), dimension(:), intent(out) :: fracliq
+        integer(i4b) :: i,iter,n
+        real(wp) :: mmin,mw,dmnet,logc_lo,logc_hi,logc_mid,qmid,frac_i, &
+            logweight,mass_power,target,capacity,min_logweight
+
+        n=parcel1%n_bin_modew
+        if (size(fracliq).ne.n .or. size(mresid).ne.n) error stop &
+            'array size mismatch in chamber_bl_inhom_target_fractions'
         fracliq=0._wp
-        if (dq_target.le.tiny(1._wp) .or. fmax.le.tiny(1._wp)) return
+        if (dq_target.le.tiny(1._wp)) return
 
         mmin=huge(1._wp)
+        capacity=0._wp
         do i=1,n
             if (parcel1%npart(i).le.tiny(1._wp)) cycle
             if (parcel1%y(i).le.tiny(1._wp)) cycle
-            mmin=min(mmin,parcel1%y(i))
+            mw=parcel1%y(i)
+            dmnet=max(mw-min(max(mresid(i),0._wp),mw),0._wp)
+            if (dmnet.le.tiny(1._wp)) cycle
+            mmin=min(mmin,mw)
+            capacity=capacity+parcel1%npart(i)*dmnet
         enddo
         if (mmin.eq.huge(1._wp)) return
 
-        ! Increase hi until either the target is bracketed or every eligible bin
-        ! has reached the processed-air cap fmax.
-        lo=0._wp
-        hi=1._wp
-        do iter=1,80
-            qmid=0._wp
+        if (dq_target.gt.capacity*(1._wp+1.e-9_wp)) then
+            write(*,*) 'Inhomogeneous BL target exceeds total removable liquid'
+            write(*,*) 'target, capacity = ',dq_target,capacity
+            error stop 'Inhomogeneous BL evaporation target exceeds capacity'
+        endif
+        target=min(max(dq_target,0._wp),capacity)
+        mass_power=chamber_bl_evap_size_exp/3._wp
+
+        if (mass_power.le.tiny(1._wp)) then
+            ! p=0: equal number fraction from every wet population.
+            frac_i=min(1._wp,target/max(capacity,tiny(1._wp)))
             do i=1,n
                 if (parcel1%npart(i).le.tiny(1._wp)) cycle
                 if (parcel1%y(i).le.tiny(1._wp)) cycle
-                mw=parcel1%y(i)
-                weight=(mmin/mw)**twothirds
-                qmid=qmid+min(fmax,hi*weight)*parcel1%npart(i)*mw
+                dmnet=max(parcel1%y(i)-min(max(mresid(i),0._wp), &
+                    parcel1%y(i)),0._wp)
+                if (dmnet.gt.tiny(1._wp)) fracliq(i)=frac_i
             enddo
-            if (qmid.ge.dq_target .or. hi.ge.1.e12_wp) exit
-            hi=2._wp*hi
+            return
+        endif
+
+        ! Solve for C in log space:
+        !
+        !     frac_i = min(1, C*weight_i)
+        !
+        ! This is robust over very broad PSDs and avoids arbitrary linear-C caps.
+        min_logweight=0._wp
+        do i=1,n
+            if (parcel1%npart(i).le.tiny(1._wp)) cycle
+            mw=parcel1%y(i)
+            if (mw.le.tiny(1._wp)) cycle
+            dmnet=max(mw-min(max(mresid(i),0._wp),mw),0._wp)
+            if (dmnet.le.tiny(1._wp)) cycle
+            logweight=mass_power*(log(mmin)-log(mw))
+            min_logweight=min(min_logweight,logweight)
         enddo
 
-        do iter=1,80
-            mid=0.5_wp*(lo+hi)
+        ! Upper bound: even the smallest active weight reaches frac=1.
+        logc_hi=-min_logweight
+        logc_lo=min(-700._wp,logc_hi-700._wp)
+
+        do iter=1,120
+            logc_mid=0.5_wp*(logc_lo+logc_hi)
             qmid=0._wp
             do i=1,n
                 if (parcel1%npart(i).le.tiny(1._wp)) cycle
-                if (parcel1%y(i).le.tiny(1._wp)) cycle
                 mw=parcel1%y(i)
-                weight=(mmin/mw)**twothirds
-                qmid=qmid+min(fmax,mid*weight)*parcel1%npart(i)*mw
+                if (mw.le.tiny(1._wp)) cycle
+                dmnet=max(mw-min(max(mresid(i),0._wp),mw),0._wp)
+                if (dmnet.le.tiny(1._wp)) cycle
+                logweight=mass_power*(log(mmin)-log(mw))
+                if (logc_mid+logweight.ge.0._wp) then
+                    frac_i=1._wp
+                else
+                    frac_i=exp(logc_mid+logweight)
+                endif
+                qmid=qmid+frac_i*parcel1%npart(i)*dmnet
             enddo
-            if (abs(qmid-dq_target).le.1.e-10_wp*max(dq_target,1.e-20_wp)) exit
-            if (qmid.lt.dq_target) then
-                lo=mid
+            if (abs(qmid-target).le.max(1.e-14_wp,1.e-10_wp*target)) exit
+            if (qmid.lt.target) then
+                logc_lo=logc_mid
             else
-                hi=mid
+                logc_hi=logc_mid
             endif
         enddo
 
         do i=1,n
             if (parcel1%npart(i).le.tiny(1._wp)) cycle
-            if (parcel1%y(i).le.tiny(1._wp)) cycle
             mw=parcel1%y(i)
-            weight=(mmin/mw)**twothirds
-            fracliq(i)=min(fmax,max(0._wp,mid*weight))
+            if (mw.le.tiny(1._wp)) cycle
+            dmnet=max(mw-min(max(mresid(i),0._wp),mw),0._wp)
+            if (dmnet.le.tiny(1._wp)) cycle
+            logweight=mass_power*(log(mmin)-log(mw))
+            if (logc_mid+logweight.ge.0._wp) then
+                fracliq(i)=1._wp
+            else
+                fracliq(i)=max(0._wp,min(1._wp,exp(logc_mid+logweight)))
+            endif
         enddo
-    end subroutine chamber_bl_d2_target_fractions
-
+    end subroutine chamber_bl_inhom_target_fractions
 
     ! ============================================================================
     ! apply_chamber_bl_exchange
@@ -8905,19 +10465,39 @@
     !>alpha_T=1, offset=0 follows the measured wall temperature.  A non-zero
     !>offset is an explicit unresolved BL-temperature sensitivity.
     !>
-    !>At T_sens, supersaturated air condenses vapour to the wall (a true chamber
-    !>total-water loss) with latent warming.  Subsaturated air evaporates
-    !>activated liquid into vapour (an internal phase transfer) with latent
-    !>cooling.  If wall condensation dries the air, the subsequent remixing
-    !>into the bulk can require additional droplet evaporation to recover the
-    !>pre-BL bulk RH.  Both direct and remixing evaporation are accumulated into
-    !>one thermodynamic target.
+    !>chamber_bl_wall_water_mode selects the wall-vapour closure:
+    !>  0 = historical instantaneous saturation-cap closure;
+    !>  1 = finite wall reservoir with fractional relaxation toward wall
+    !>      equilibrium.  Its exchange strength is coupled to fmix/tau;
+    !>  2 = finite wall reservoir with a physical vapour mass-transfer flux
+    !>      Jv=km*(e_eq-e)/(Rv*Tgas), integrated over the chamber wall area.
+    !>      km sets the chamber-mean wall water budget independently of tau.
+    !>      Particles in the fmix fraction that visits the BL experience the
+    !>      corresponding local humidity change dq_wall/fmix, bounded so it
+    !>      cannot overshoot equilibrium with the measured wall temperature.
+    !>Modes 1 and 2 both use measured Twall, allow dry-wall deposition, cap
+    !>wall vapour sources by stored water, and impose no artificial restoration
+    !>of the pre-BL relative humidity.
     !>
     !>chamber_bl_evap_mode controls how the liquid part of that target is
     !>represented in the warm PSD:
-    !>  1 = homogeneous D^2-law shrinkage (common Delta D^2),
-    !>  2 = uniform extreme inhomogeneous complete evaporation,
-    !>  3 = D^2-lifetime-weighted extreme inhomogeneous complete evaporation.
+    !>  1 = homogeneous D^2-law shrinkage (common Delta D^2);
+    !>  2 = extreme inhomogeneous complete evaporation.  Every wet warm
+    !>      population participates and survivors retain their original size.
+    !>
+    !>chamber_bl_evap_size_exp=p is common to BOTH representations:
+    !>  mode 1: it controls the transformed liquid-mass decrement; p=2 is a
+    !>          common finite D^2 decrement and p=0 is equal fractional shrinkage;
+    !>  mode 2: it controls complete-particle selection as m_w^(-p/3); p=0 is
+    !>          uniform number-fraction removal and p=2 is inverse-D^2 lifetime
+    !>          weighting.
+    !>
+    !>The wall/BL thermodynamic calculation is upstream of this representation
+    !>choice.  Both modes must therefore produce the same NET liquid-water loss
+    !>dq_evap_target for a given event; only PSD size versus number changes.
+    !>For inhomogeneous evaporation, `fmix` acts only in the common AIR-side
+    !>thermodynamic target.  The PSD response is then free to redistribute that
+    !>fixed liquid-water loss across particle sizes without a second fmix cap.
     !>
     !>As in the entrainment closure, warm liquid is always used first.  Only
     !>when the liquid reservoir available to this BL event is exhausted and the
@@ -8926,7 +10506,9 @@
     !>available processed ice is insufficient the remaining ice-subsaturation is
     !>retained.  Completely sublimated ice releases its aerosol/INP residual.
     !>
-    !>qchamber_bl is cumulative true water loss to the wall.  The separate
+    !>qchamber_bl is cumulative net wall-water loss: positive means net air ->
+    !>wall and negative means net wall -> air.  Separate liquid/ice source/sink
+    !>diagnostics retain positive cumulative magnitudes.  The separate
     !>qchamber_bl_evap diagnostic is cumulative liquid->vapour phase transfer
     !>caused by BL processing and must not be interpreted as chamber water loss.
     ! ============================================================================
@@ -8951,6 +10533,8 @@
 
         parcel1%qchamber_bl_step=0._wp
         parcel1%qchamber_bl_evap_step=0._wp
+        parcel1%chamber_wall_rh=0._wp
+        parcel1%chamber_wall_vapour_flux=0._wp
         if (chamber_bl_mix.eq.0) return
         if (chamber_bl_mix.ne.1) error stop 'chamber_bl_mix must be 0 or 1'
         if (chamber_bl_tau.le.0._wp) error stop 'chamber_bl_tau must be > 0'
@@ -8992,8 +10576,10 @@
             ql_total,ql_warm,qi0,qtot_target,fliq,fice,tnew,qv_new,qcond_new,qv_budget, &
             svp_new,factor,var,dummy,tquery,dq_wall_local,dq_evap_local,dq_evap_target, &
             dq_evap_cold,dq_actual,qsw_target,qv_target,cpm,rhw_new,ql_after,qi_before, &
-            qv_after_liq,tice_new,qvice_new,rhw_ice,rhi_ice,liq_event_capacity
-        real(wp), allocatable :: fracliq(:)
+            qv_after_liq,tice_new,qvice_new,rhw_ice,rhi_ice,liq_event_capacity, &
+            dq_wall_liq_local,dq_wall_ice_local,dq_wall_liq,dq_wall_ice,qv_wall_local, &
+            qbudget_check,ql_expected,ql_rep_tol,t_resid_bl,rh_resid_bl
+        real(wp), allocatable :: fracliq(:),mresid(:)
         logical :: liquid_exhausted
 
         parcel1%qchamber_bl_step=0._wp
@@ -9021,12 +10607,13 @@
         fmix=1._wp-exp(-dt_bl/chamber_bl_tau)
         fmix=max(0._wp,min(fmix,1._wp))
 
-        ! Interpolate measured wall temperature only when alpha_T actually uses it.
-        ! For alpha_T=0 the result is independent of Twall, so a wall series is not
-        ! required and T_wall is set equal to Tgas for numerical clarity.
-        if (chamber_bl_alpha_t.gt.0._wp) then
+        ! Interpolate measured wall temperature when it is needed either by the
+        ! sensible-temperature interpolation or by finite wall-reservoir vapour
+        ! exchange.  In legacy mode with alpha_T=0, Twall is unused and T_wall
+        ! is set equal to Tgas for numerical clarity.
+        if (chamber_bl_alpha_t.gt.0._wp .or. chamber_bl_wall_water_mode.ge.1) then
             if (n_levels_c.lt.2) error stop &
-                'chamber_bl_alpha_t > 0 requires wall_temp_chamber observations'
+                'chamber BL thermal/wall-water processing requires wall_temp_chamber observations'
             tquery=min(max(parcel1%tt,time_chamber(1)),time_chamber(n_levels_c))
             iloc=find_pos(time_chamber(1:n_levels_c),tquery)
             iloc=max(1,min(iloc,n_levels_c-1))
@@ -9038,27 +10625,83 @@
         endif
 
         t_sens=t0+chamber_bl_alpha_t*(t_wall-t0)+chamber_bl_temp_offset
-        call diagnose_coupled_chamber_bl_state(t_sens,qv0,ql_warm,p, &
-            t_bl,qv_bl,dq_wall_local,dq_evap_local)
-
-        ! Convert local BL changes to chamber-mean changes.  dq_wall is negative
-        ! internally for true airborne-water loss; qchamber_bl stores positive loss.
-        dq_wall=-fmix*max(dq_wall_local,0._wp)
-        dq_wall=max(dq_wall,-qv0)
-        qv_air=max(qv0+dq_wall,0._wp)
-        dq_evap_target=fmix*max(dq_evap_local,0._wp)
-
-        ! Cold/supersaturated BL processing can remove vapour to the wall.  After
-        ! returning to the measured bulk temperature, diagnose the liquid amount
-        ! needed to restore the pre-BL RH.  This phase transfer is not an extra
-        ! total-water loss: the external loss already occurred in dq_wall.
+        dq_wall_liq=0._wp
+        dq_wall_ice=0._wp
         dq_evap_cold=0._wp
-        if (dq_wall.lt.0._wp) then
-            qsw_target=eps1*svp_liq(t0)/max(p-svp_liq(t0),tiny(1._wp))
-            qv_target=min(max(rh0,0._wp),1._wp)*qsw_target
-            dq_evap_cold=max(qv_target-qv_air,0._wp)
-            dq_evap_target=dq_evap_target+dq_evap_cold
+
+        select case(chamber_bl_wall_water_mode)
+        case(0)
+            ! Legacy closure retained exactly for reproducibility: local
+            ! supersaturation is capped by instantaneous wall condensation and
+            ! cold-wall drying may subsequently evaporate liquid on remixing to
+            ! restore the pre-BL bulk RH.
+            call diagnose_coupled_chamber_bl_state(t_sens,qv0,ql_warm,p, &
+                t_bl,qv_bl,dq_wall_local,dq_evap_local)
+            dq_wall=-fmix*max(dq_wall_local,0._wp)
+            dq_wall=max(dq_wall,-qv0)
+            qv_air=max(qv0+dq_wall,0._wp)
+            dq_evap_target=fmix*max(dq_evap_local,0._wp)
+
+            if (dq_wall.lt.0._wp) then
+                qsw_target=eps1*svp_liq(t0)/max(p-svp_liq(t0),tiny(1._wp))
+                qv_target=min(max(rh0,0._wp),1._wp)*qsw_target
+                dq_evap_cold=max(qv_target-qv_air,0._wp)
+                dq_evap_target=dq_evap_target+dq_evap_cold
+            endif
+
+        case(1)
+            ! Finite-reservoir fractional-relaxation closure retained for
+            ! reproducibility.  Wall exchange is coupled to fmix and therefore
+            ! to chamber_bl_tau.
+            call diagnose_chamber_wall_water_exchange(t_wall,t0,qv0,p,fmix, &
+                dq_wall_liq,dq_wall_ice,qv_wall_local)
+            call diagnose_chamber_bl_evaporation_state(t_sens,qv_wall_local, &
+                ql_warm,p,t_bl,qv_bl,dq_evap_local)
+
+            dq_wall=dq_wall_liq+dq_wall_ice
+            qv_air=max(qv0+dq_wall,0._wp)
+            dq_evap_target=fmix*max(dq_evap_local,0._wp)
+
+            ! Diagnose RH with respect to the wall and the actual signed
+            ! area-mean wall flux for direct comparison with mode 2.
+            svp_new=merge(svp_liq(t_wall),svp_ice(t_wall),t_wall.ge.ttr)
+            parcel1%chamber_wall_rh= &
+                (p*max(qv0,0._wp)/max(eps1+max(qv0,0._wp),tiny(1._wp)))/ &
+                max(svp_new,tiny(1._wp))
+            parcel1%chamber_wall_vapour_flux=dq_wall* &
+                chamber_dry_air_mass(p,t0,qv0)/(chamber_wall_area()*dt_bl)
+
+        case(2)
+            ! Physical finite-rate wall transfer and particle evaporation are
+            ! solved as one local BL encounter.  Vapour generated by liquid
+            ! evaporation therefore contributes immediately to the wall-flux
+            ! driving humidity and can be deposited during this same substep.
+            ! The wall reservoir is committed only once after convergence.
+            call diagnose_coupled_chamber_wall_evaporation(t_wall,t0,t_sens, &
+                qv0,ql_warm,p,dt_bl,fmix,dq_wall_liq,dq_wall_ice, &
+                qv_wall_local,t_bl,qv_bl,dq_evap_local)
+
+            dq_wall=dq_wall_liq+dq_wall_ice
+            qv_air=max(qv0+dq_wall,0._wp)
+            dq_evap_target=fmix*max(dq_evap_local,0._wp)
+
+        case default
+            error stop 'Invalid chamber_bl_wall_water_mode'
+        end select
+
+        if (chamber_bl_wall_water_mode.ge.1) then
+            ! Positive component changes are wall sources; negative changes are
+            ! wall sinks.  Store cumulative positive magnitudes separately.
+            parcel1%qchamber_wall_liq_evap=parcel1%qchamber_wall_liq_evap+ &
+                max(dq_wall_liq,0._wp)
+            parcel1%qchamber_wall_liq_cond=parcel1%qchamber_wall_liq_cond+ &
+                max(-dq_wall_liq,0._wp)
+            parcel1%qchamber_wall_ice_subl=parcel1%qchamber_wall_ice_subl+ &
+                max(dq_wall_ice,0._wp)
+            parcel1%qchamber_wall_ice_dep=parcel1%qchamber_wall_ice_dep+ &
+                max(-dq_wall_ice,0._wp)
         endif
+
         dq_evap_target=min(max(dq_evap_target,0._wp),max(ql_warm,0._wp))
 
         ! With measured T forcing active, BL processing is a subgrid water/PSD
@@ -9072,6 +10715,8 @@
         tnew=t_air
 
         qtot_target=qv0+ql_total+qi0+dq_wall
+        ! qchamber_bl uses the historical positive-loss convention.  A wall
+        ! vapour source therefore appears as a negative net loss in mode 1.
         parcel1%qchamber_bl_step=-dq_wall
         parcel1%qchamber_bl=parcel1%qchamber_bl-dq_wall
 
@@ -9084,66 +10729,89 @@
         liq_event_capacity=0._wp
         select case(chamber_bl_evap_mode)
         case(1)
-            ! Homogeneous diffusional evaporation: same finite D^2 decrement for
-            ! every wet warm particle.  Small particles may naturally reach zero.
+            ! Homogeneous representation: retain number and reduce liquid
+            ! mass/size using the common evaporation size exponent p.
             call apply_chamber_bl_homogeneous_evaporation(dq_evap_target,dq_actual)
             liq_event_capacity=max(ql_warm,0._wp)
             liquid_exhausted=(liq_event_capacity.le.tiny(1._wp)) .or. &
                 (dq_actual.ge.(1._wp-1.e-10_wp)*liq_event_capacity)
 
         case(2)
-            ! Uniform extreme inhomogeneous: the same fraction of every wet warm
-            ! bin disappears completely; survivors keep their original size.
-            if (ql_warm.gt.tiny(1._wp) .and. dq_evap_target.gt.tiny(1._wp)) then
-                fliq=min(fmix,max(0._wp,dq_evap_target/ql_warm))
+            ! Inhomogeneous representation: selected wet particles evaporate
+            ! completely to DRY aerosol residuals and survivors retain their
+            ! original size.  This represents unresolved mixing of wall-
+            ! conditioned AIR with the chamber, not literal particle-wall
+            ! encounters.  The SAME dq_evap_target as homogeneous mode is
+            ! enforced as the net liquid-water loss.
+            if (chamber_bl_wall_water_mode.eq.2) then
+                t_resid_bl=t_bl
+                qsw_target=eps1*svp_liq(t_bl)/ &
+                    max(p-svp_liq(t_bl),tiny(1._wp))
+                rh_resid_bl=max(qv_bl,0._wp)/max(qsw_target,tiny(1._wp))
             else
-                fliq=0._wp
+                t_resid_bl=tnew
+                qsw_target=eps1*svp_liq(tnew)/ &
+                    max(p-svp_liq(tnew),tiny(1._wp))
+                ! The common thermodynamic target is the net liquid-to-vapour
+                ! conversion, so use that target rather than a representation-
+                ! dependent gross removed-water amount.
+                rh_resid_bl=(qv_air+dq_evap_target)/ &
+                    max(qsw_target,tiny(1._wp))
             endif
-            dq_actual=fliq*ql_warm
-            qsw_target=eps1*svp_liq(tnew)/max(p-svp_liq(tnew),tiny(1._wp))
-            rhw_new=(qv_air+dq_actual)/max(qsw_target,tiny(1._wp))
-            call prepare_released_hydrometeor_aerosol(fliq,0._wp,tnew,rhw_new, &
-                all_warm_liquid=.true.)
-            do i=1,n
-                factor=1._wp
-                if (parcel1%npart(i).gt.tiny(1._wp) .and. &
-                    parcel1%y(i).gt.tiny(1._wp)) factor=1._wp-fliq
-                parcel1%npart(i)=parcel1%npart(i)*factor
-                parcel1%moments(i,:)=parcel1%moments(i,:)*factor
-            enddo
-            call merge_released_aerosol_into_warm()
-            liq_event_capacity=fmix*max(ql_warm,0._wp)
-            liquid_exhausted=(liq_event_capacity.le.tiny(1._wp)) .or. &
-                (dq_actual.ge.(1._wp-1.e-10_wp)*liq_event_capacity)
 
-        case(3)
-            ! Extreme inhomogeneous with inverse D^2 evaporation-lifetime
-            ! weighting.  Selected droplets disappear completely; survivors do
-            ! not shrink.  Small droplets are preferentially selected.
-            allocate(fracliq(n))
-            call chamber_bl_d2_target_fractions(dq_evap_target,fmix,fracliq)
-            dq_actual=sum(fracliq*parcel1%npart*parcel1%y(1:n))
-            qsw_target=eps1*svp_liq(tnew)/max(p-svp_liq(tnew),tiny(1._wp))
-            rhw_new=(qv_air+dq_actual)/max(qsw_target,tiny(1._wp))
-            call prepare_released_hydrometeor_aerosol(0._wp,0._wp,tnew,rhw_new, &
-                liq_factors=fracliq,all_warm_liquid=.true.)
+            allocate(fracliq(n),mresid(n))
+            ! Complete evaporation means zero liquid water on the residual
+            ! during this operator.  Normal condensation may rehydrate it later.
+            call chamber_bl_residual_water_masses(t_resid_bl,rh_resid_bl,mresid)
+            call chamber_bl_inhom_target_fractions(dq_evap_target,mresid, &
+                fracliq)
+
+            call prepare_released_hydrometeor_aerosol(0._wp,0._wp,t_resid_bl, &
+                rh_resid_bl,liq_factors=fracliq,all_warm_liquid=.true., &
+                residual_water_masses=mresid)
+
             do i=1,n
                 factor=1._wp
                 if (parcel1%npart(i).gt.tiny(1._wp) .and. &
                     parcel1%y(i).gt.tiny(1._wp)) &
-                    factor=1._wp-max(0._wp,min(fracliq(i),fmix))
+                    factor=1._wp-max(0._wp,min(fracliq(i),1._wp))
                 parcel1%npart(i)=parcel1%npart(i)*factor
                 parcel1%moments(i,:)=parcel1%moments(i,:)*factor
             enddo
             call merge_released_aerosol_into_warm()
-            liq_event_capacity=fmix*max(ql_warm,0._wp)
+
+            ! dq_actual is deliberately the NET liquid loss after residual haze
+            ! water has been returned, making it directly comparable with the
+            ! homogeneous representation and with dq_evap_target.
+            ql_after=sum(parcel1%npart*parcel1%y(1:n))
+            dq_actual=max(ql_warm-ql_after,0._wp)
+            liq_event_capacity=max(ql_warm,0._wp)
             liquid_exhausted=(liq_event_capacity.le.tiny(1._wp)) .or. &
                 (dq_actual.ge.(1._wp-1.e-10_wp)*liq_event_capacity)
-            deallocate(fracliq)
+            deallocate(fracliq,mresid)
 
         case default
             error stop 'Invalid chamber_bl_evap_mode'
         end select
+
+        ! Evaporation mode is a PSD representation choice only.  For identical
+        ! wall/BL thermodynamics, homogeneous and inhomogeneous modes MUST leave
+        ! the same bulk liquid water.  Enforce that invariant here so future
+        ! changes cannot silently make wall interaction or total LWC depend on
+        ! whether the target was represented by size loss or number loss.
+        ql_after=sum(parcel1%npart*parcel1%y(1:n))
+        ql_expected=max(ql_warm-dq_evap_target,0._wp)
+        ql_rep_tol=max(1.e-13_wp,1.e-8_wp*max(abs(ql_warm), &
+            abs(dq_evap_target),1.e-12_wp))
+        if (abs(ql_after-ql_expected).gt.ql_rep_tol) then
+            write(*,*) 'BL evaporation representation changed bulk liquid water'
+            write(*,*) 'evap mode, p = ',chamber_bl_evap_mode, &
+                chamber_bl_evap_size_exp
+            write(*,*) 'ql before,target,expected,actual = ',ql_warm, &
+                dq_evap_target,ql_expected,ql_after
+            error stop 'Chamber BL homogeneous/inhomogeneous LWC invariant failed'
+        endif
+        dq_actual=max(ql_warm-ql_after,0._wp)
 
         parcel1%qchamber_bl_evap_step=max(dq_actual,0._wp)
         parcel1%qchamber_bl_evap=parcel1%qchamber_bl_evap+ &
@@ -9152,7 +10820,8 @@
         ! If gas temperature is prognostic, include the latent cooling associated
         ! with the cold-wall remixing evaporation.  Direct local evaporation was
         ! already included in t_bl by the coupled BL solve.
-        if (.not.chamber_force_temperature .and. dq_wall.lt.0._wp) then
+        if (.not.chamber_force_temperature .and. chamber_bl_wall_water_mode.eq.0 .and. &
+            dq_wall.lt.0._wp) then
             cpm=max(cp+qv0*cpv+ql_total*cpw+qi0*cpi,0.5_wp*cp)
             tnew=tnew-lv*min(dq_evap_cold,dq_actual)/cpm
         endif
@@ -9198,7 +10867,7 @@
 
 
         ! Internal evaporation redistributes airborne water only.  Close total
-        ! water exactly to the true external wall sink so modes 1-3 conserve the
+        ! water exactly to the true external wall sink so modes 1-2 conserve the
         ! same qtot to roundoff for a given thermodynamic BL event.
         qcond_new=sum(parcel1%npart*parcel1%y(1:n))
         if (parcel1%ice_flag.eq.1) qcond_new=qcond_new+ &
@@ -9207,6 +10876,9 @@
         if (qv_budget.lt.-1.e-12_wp) error stop &
             'Chamber BL phase adjustment exceeded available total water'
         qv_new=max(qv_budget,0._wp)
+        qbudget_check=qv_new+qcond_new-qtot_target
+        if (abs(qbudget_check).gt.max(1.e-12_wp,1.e-9_wp*max(abs(qtot_target),1.e-12_wp))) &
+            error stop 'Chamber BL final total-water consistency check failed'
 
         parcel1%y(parcel1%ite)=tnew
         svp_new=svp_liq(tnew)
@@ -9574,11 +11246,10 @@
         dsigma_liq,rel_disp_liq
     real(wp) :: m0_ice,m1_ice,m2_ice,dmean_ice,dsigma_ice,rel_disp_ice
     real(wp) :: svp1,qv,rm,rhod,beta_ext, beta_abs,beta_ext_ice, beta_abs_ice
-	real(wp) :: phi_mean,nmon_mean,rhoi_mean, nact, test, &
-        mcrit,mlower,mupper,fracact,activated_mass_width
+	real(wp) :: phi_mean,nmon_mean,rhoi_mean, nact, test
     real(wp) :: denom
     real(wp) :: fallrate_liq,fallrate_ice
-    integer(i4b) :: i,ibin_diag,imode_diag
+    integer(i4b) :: i
     
     ! output to netcdf file
     if(new_file) then
@@ -9700,6 +11371,10 @@
                    "BMM bin scheme: 0 full-moving, 1 moving-centre, 2 Chen-Lamb") )
         call check( nf90_put_att(io1%ncid,NF90_GLOBAL,"bin_scheme_flag", &
                    parcel1%bin_scheme_flag) )
+        call check( nf90_put_att(io1%ncid,NF90_GLOBAL,"fixed_grid_mode", &
+                   fixed_grid_mode) )
+        call check( nf90_put_att(io1%ncid,NF90_GLOBAL,"fixed_grid_mode_description", &
+                   "0 legacy; 1 equal-number aerosol bins to dmaxa + geometric cloud bins to dmaxc") )
 
         ! define variable: activated liquid-drop number
         call check( nf90_def_var(io1%ncid, "ndrop", NF90_DOUBLE, &
@@ -9712,9 +11387,10 @@
         call check( nf90_put_att(io1%ncid,io1%a_dimid,"long_name", &
                    "activated liquid-drop number mixing ratio") )
         call check( nf90_put_att(io1%ncid,io1%a_dimid,"comment", &
-                   "For bin schemes 1 and 2, if the Koehler critical water "// &
-                   "mass lies inside a fixed mass bin, only the fraction "// &
-                   "(mupper-mcrit)/(mupper-mlower) of that bin is activated.") )
+                   "Full-moving and moving-centre bins use the point "// &
+                   "representative activation criterion. Chen-Lamb integrates "// &
+                   "its reconstructed within-bin number distribution above "// &
+                   "the Koehler/FHH critical water mass.") )
                    
         ! Liquid-drop bulk size diagnostics. These are calculated from the
         ! same activated population used for ndrop and from the instantaneous
@@ -9763,8 +11439,9 @@
         call check( nf90_put_att(io1%ncid,io1%varid,"long_name", &
                    "activated liquid-drop number mixing ratio in each native bin") )
         call check( nf90_put_att(io1%ncid,io1%varid,"comment", &
-                   "For fixed-bin schemes 1 and 2 this may be a fractional "// &
-                   "portion of nwat when the activation threshold cuts a bin.") )
+                   "For Chen-Lamb this may be a fractional portion of nwat "// &
+                   "from the reconstructed within-bin distribution. "// &
+                   "Moving-centre bins are point populations.") )
 
         ! define variable: mwat
         call check( nf90_def_var(io1%ncid, "mwat", NF90_DOUBLE, &
@@ -9848,7 +11525,7 @@
                 (/io1%x_dimid/),io1%varid))
             call check(nf90_put_att(io1%ncid,io1%varid,"units","kg kg-1"))
             call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
-                "cumulative airborne water lost by chamber BL condensation to the wall"))
+                "cumulative net airborne water loss to chamber wall; negative means net wall source"))
             call check(nf90_def_var(io1%ncid,"qchamber_bl_evap",NF90_DOUBLE, &
                 (/io1%x_dimid/),io1%varid))
             call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
@@ -9865,7 +11542,48 @@
                 (/io1%x_dimid/),io1%varid))
             call check(nf90_put_att(io1%ncid,io1%varid,"units","kg kg-1"))
             call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
-                "airborne water lost by chamber BL condensation to wall in previous timestep"))
+                "net airborne water loss to chamber wall in previous timestep; negative means source"))
+
+            call check(nf90_def_var(io1%ncid,"qchamber_wall_liq_evap",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg kg-1"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "cumulative vapour source from chamber-wall liquid reservoir"))
+            call check(nf90_def_var(io1%ncid,"qchamber_wall_liq_cond",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg kg-1"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "cumulative vapour sink by condensation to chamber-wall liquid reservoir"))
+            call check(nf90_def_var(io1%ncid,"qchamber_wall_ice_subl",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg kg-1"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "cumulative vapour source from chamber-wall ice/frost reservoir"))
+            call check(nf90_def_var(io1%ncid,"qchamber_wall_ice_dep",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg kg-1"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "cumulative vapour sink by deposition to chamber-wall ice/frost reservoir"))
+            call check(nf90_def_var(io1%ncid,"chamber_wall_liquid_water",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "prognostic liquid-water mass stored on chamber wall"))
+            call check(nf90_def_var(io1%ncid,"chamber_wall_ice_water",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "prognostic ice/frost mass stored on chamber wall"))
+            call check(nf90_def_var(io1%ncid,"chamber_wall_rh",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","1"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "water-vapour relative humidity with respect to measured chamber wall temperature"))
+            call check(nf90_def_var(io1%ncid,"chamber_wall_vapour_flux",NF90_DOUBLE, &
+                (/io1%x_dimid/),io1%varid))
+            call check(nf90_put_att(io1%ncid,io1%varid,"units","kg m-2 s-1"))
+            call check(nf90_put_att(io1%ncid,io1%varid,"long_name", &
+                "signed actual chamber-wall vapour mass flux; positive wall to air"))
         endif
 
         if (chamber_fan_loss.gt.0) then
@@ -10150,45 +11868,25 @@
     ! Diagnose activated drops once and use exactly the same population for
     ! ndrop, bulk size moments, relative dispersion and the native nliq PSD.
     !
-    ! Full-moving particles are point representatives.  For fixed-bin schemes
-    ! 1 and 2, if the critical water mass cuts a bin, assume uniform number per
-    ! unit water mass within that fixed interval and count only the portion
-    ! above the activation threshold.
+    ! Full-moving and moving-centre bins are point populations at their current
+    ! representative water mass, so activation is all-or-nothing for each
+    ! occupied numerical bin.  Chen-Lamb explicitly represents a finite-width
+    ! linear number distribution inside each fixed mass interval; for that
+    ! scheme integrate the reconstructed distribution above the same critical
+    ! Koehler/FHH water mass used by particle_is_activated.
     parcel1%ndrop=0._wp
     select case(parcel1%bin_scheme_flag)
-    case(BIN_FULL_MOVING)
+    case(BIN_FULL_MOVING,BIN_MOVING_CENTRE)
         do i=1,parcel1%n_bin_modew
             if (parcel1%npart(i) <= 0._wp) cycle
             if (particle_is_activated(i,parcel1%y(i), &
                 parcel1%y(parcel1%ite))) parcel1%ndrop(i)=parcel1%npart(i)
         enddo
 
-    case(BIN_MOVING_CENTRE,BIN_CHEN_LAMB)
+    case(BIN_CHEN_LAMB)
         do i=1,parcel1%n_bin_modew
-            if (parcel1%npart(i) <= 0._wp) cycle
-            if (parcel1%y(i) <= tiny(1._wp)) cycle
-
-            ibin_diag=mod(i-1,parcel1%n_bins1)+1
-            imode_diag=(i-1)/parcel1%n_bins1+1
-            mlower=parcel1%mbinedges(ibin_diag,imode_diag)
-            mupper=parcel1%mbinedges(ibin_diag+1,imode_diag)
-            if (mupper <= mlower) then
-                print *,'Invalid water-mass bin in ndrop diagnostic'
-                print *,'mode/bin/lower/upper = ',imode_diag,ibin_diag,mlower,mupper
-                error stop 'non-positive ndrop diagnostic bin width'
-            endif
-
-            mcrit=particle_activation_water_mass(i,parcel1%y(parcel1%ite))
-            if (mcrit <= mlower) then
-                fracact=1._wp
-            elseif (mcrit >= mupper) then
-                fracact=0._wp
-            else
-                activated_mass_width=mupper-mcrit
-                fracact=activated_mass_width/(mupper-mlower)
-            endif
-            fracact=min(max(fracact,0._wp),1._wp)
-            parcel1%ndrop(i)=fracact*parcel1%npart(i)
+            parcel1%ndrop(i)=chen_lamb_activated_number( &
+                i,parcel1%y(parcel1%ite))
         enddo
 
     case default
@@ -10301,6 +11999,30 @@
         call check(nf90_inq_varid(io1%ncid,"qchamber_bl_step",io1%varid))
         call check(nf90_put_var(io1%ncid,io1%varid, &
             parcel1%qchamber_bl_step,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"qchamber_wall_liq_evap",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%qchamber_wall_liq_evap,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"qchamber_wall_liq_cond",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%qchamber_wall_liq_cond,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"qchamber_wall_ice_subl",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%qchamber_wall_ice_subl,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"qchamber_wall_ice_dep",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%qchamber_wall_ice_dep,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"chamber_wall_liquid_water",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%chamber_wall_liquid_water,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"chamber_wall_ice_water",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%chamber_wall_ice_water,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"chamber_wall_rh",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%chamber_wall_rh,start=(/io1%icur/)))
+        call check(nf90_inq_varid(io1%ncid,"chamber_wall_vapour_flux",io1%varid))
+        call check(nf90_put_var(io1%ncid,io1%varid, &
+            parcel1%chamber_wall_vapour_flux,start=(/io1%icur/)))
     endif
 
     if (chamber_fan_loss.gt.0) then
@@ -10419,7 +12141,7 @@
 			parcel1%n_comps+3))		
 		if(denom > tiny(1._wp)) then
 			rhoi_mean = &
-				(sum(parcel1%yice*parcel1%npartice) - &
+				(sum(parcel1%yice(1:parcel1%n_bin_modew)*parcel1%npartice) - &
 				 sum(parcel1%moments( &
 					 parcel1%n_bin_modew+1:parcel1%n_bin_mode, &
 					 parcel1%n_comps+4))) / denom

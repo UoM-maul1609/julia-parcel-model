@@ -41,7 +41,7 @@
     !> Use an adiabatic environmental profile when .true.; false permits entrainment treatments.
  	adiabatic_prof=.true.,
     !> Entrain vertically when .true.; use lateral entrainment when .false.
-    vert_ent=.true.,
+    vert_ent=.false.,
 	!> Prescribed cloud-top height [m].
 	!> The parcel simulation stops when its height reaches or exceeds z_ctop.
 	!> Set <= 0 to disable the cloud-top stopping criterion.
@@ -76,10 +76,20 @@
     chamber_bl_mix = 0,
     !> E-folding timescale for bulk-air recirculation through the wall BL [s].
     chamber_bl_tau = 60.0,
-    !> BL temperature: 0=fixed offset from evolving gas T; 1=wall_temp_chamber(t).
-    chamber_bl_temp_mode = 0,
-    !> Used only for chamber_bl_temp_mode=0: T_BL - T_gas [K].
+    !> Effective sensible BL temperature:
+    !> T_sens=T_gas+chamber_bl_alpha_t*(T_wall-T_gas)+chamber_bl_temp_offset.
+    !> 0.0 reproduces the former chamber_bl_temp_mode=0 (offset from gas T).
+    chamber_bl_alpha_t = 0.0,
+    !> Additional BL temperature offset T_BL - T_gas [K].
     chamber_bl_temp_offset = 0.0,
+    !> Wall-vapour closure: 0=legacy saturation cap; 1=finite wet/icy surface exchange.
+    chamber_bl_wall_water_mode = 0,
+    !> Effective wall-area fractions exchanging as liquid water and ice/frost.
+    !> Their sum must not exceed one; the remainder is dry wall.
+    chamber_wall_liquid_fraction = 0.0,
+    chamber_wall_ice_fraction = 0.0,
+    !> Fractional equilibration during one BL wall encounter [0..1].
+    chamber_wall_water_efficiency = 1.0,
 
     !> Drone-fan blade loss: 0=off, 1=saturating sigmoid in current particle diameter.
     chamber_fan_loss = 0,
@@ -130,7 +140,7 @@
     !> Sounding height profile [m].
 	z_read(1:151)     = 0.000000e+00, 1.000000e+01, 2.000000e+01, 3.000000e+01, 4.000000e+01, 5.000000e+01, 6.000000e+01, 7.000000e+01, 8.000000e+01, 9.000000e+01, 1.000000e+02, 1.100000e+02, 1.200000e+02, 1.300000e+02, 1.400000e+02, 1.500000e+02, 1.600000e+02, 1.700000e+02, 1.800000e+02, 1.900000e+02, 2.000000e+02, 2.100000e+02, 2.200000e+02, 2.300000e+02, 2.400000e+02, 2.500000e+02, 2.600000e+02, 2.700000e+02, 2.800000e+02, 2.900000e+02, 3.000000e+02, 3.100000e+02, 3.200000e+02, 3.300000e+02, 3.400000e+02, 3.500000e+02, 3.600000e+02, 3.700000e+02, 3.800000e+02, 3.900000e+02, 4.000000e+02, 4.100000e+02, 4.200000e+02, 4.300000e+02, 4.400000e+02, 4.500000e+02, 4.600000e+02, 4.700000e+02, 4.800000e+02, 4.900000e+02, 5.000000e+02, 5.100000e+02, 5.200000e+02, 5.300000e+02, 5.400000e+02, 5.500000e+02, 5.600000e+02, 5.700000e+02, 5.800000e+02, 5.900000e+02, 6.000000e+02, 6.100000e+02, 6.200000e+02, 6.300000e+02, 6.400000e+02, 6.500000e+02, 6.600000e+02, 6.700000e+02, 6.800000e+02, 6.900000e+02, 7.000000e+02, 7.100000e+02, 7.200000e+02, 7.300000e+02, 7.400000e+02, 7.500000e+02, 7.600000e+02, 7.700000e+02, 7.800000e+02, 7.900000e+02, 8.000000e+02, 8.100000e+02, 8.200000e+02, 8.300000e+02, 8.400000e+02, 8.500000e+02, 8.600000e+02, 8.700000e+02, 8.800000e+02, 8.900000e+02, 9.000000e+02, 9.100000e+02, 9.200000e+02, 9.300000e+02, 9.400000e+02, 9.500000e+02, 9.600000e+02, 9.700000e+02, 9.800000e+02, 9.900000e+02, 1.000000e+03, 1.010000e+03, 1.020000e+03, 1.030000e+03, 1.040000e+03, 1.050000e+03, 1.060000e+03, 1.070000e+03, 1.080000e+03, 1.090000e+03, 1.100000e+03, 1.110000e+03, 1.120000e+03, 1.130000e+03, 1.140000e+03, 1.150000e+03, 1.160000e+03, 1.170000e+03, 1.180000e+03, 1.190000e+03, 1.200000e+03, 1.210000e+03, 1.220000e+03, 1.230000e+03, 1.240000e+03, 1.250000e+03, 1.260000e+03, 1.270000e+03, 1.280000e+03, 1.290000e+03, 1.300000e+03, 1.310000e+03, 1.320000e+03, 1.330000e+03, 1.340000e+03, 1.350000e+03, 1.360000e+03, 1.370000e+03, 1.380000e+03, 1.390000e+03, 1.400000e+03, 1.410000e+03, 1.420000e+03, 1.430000e+03, 1.440000e+03, 1.450000e+03, 1.460000e+03, 1.470000e+03, 1.480000e+03, 1.490000e+03, 1.500000e+03/
 &aerosol_spec
-    !> Lognormal aerosol number concentration [m-3]; indexed by internal submode and external mode.
+    !> Lognormal aerosol number concentration [kg-1]; indexed by internal submode and external mode.
  	n_aer1(1:3,1)        = 401.e6, 550.e6, 460.e6,
     !> Lognormal number-median dry diameter [m]; required positive for populated submodes.
     d_aer1(1:3,1)        = 1.3e-8   , 4.4e-8, 1.36e-7,
