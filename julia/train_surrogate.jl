@@ -41,6 +41,11 @@ else
     println("training device: CPU")
 end
 
+batch_request = lowercase(get(ENV, "BATCHSIZE", "auto"))
+batchsize = batch_request == "auto" ? (use_gpu ? 64 : 16) : parse(Int, batch_request)
+batchsize > 0 || error("BATCHSIZE must be positive")
+kind == "profile" && println("profile minibatch size: $batchsize trajectories")
+
 model_dir = get(ENV, "MODEL_DIR", ".")
 results_dir = get(ENV, "RESULTS_DIR", ".")
 mkpath(model_dir)
@@ -65,7 +70,7 @@ Random.seed!(seed)
 if kind == "profile"
     p, m = build_profile_model(hscale=hscale)
     p = to_device(p)
-    train_profile!(p, m, split.train; epochs=epochs, val_cases=split.val, rng=rng, device=to_device)
+    train_profile!(p, m, split.train; epochs=epochs, batchsize=batchsize, val_cases=split.val, rng=rng, device=to_device)
     p = use_gpu ? Array(p) : p
     println("train metrics: ", evaluate_profile(m, p, split.train))
     println("validation metrics: ", evaluate_profile(m, p, split.val))

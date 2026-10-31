@@ -14,6 +14,7 @@ PROFILE_EPOCHS ?= 150
 NEURALODE_EPOCHS ?= 40
 NPLOTS ?= 8
 DEVICE ?= auto
+BATCHSIZE ?= auto
 
 DATA_DIR ?= data
 MODEL_DIR ?= models
@@ -63,6 +64,7 @@ help:
 	@echo "  SURROGATE_SEED=20260831    Reproducible sampling/train split seed"
 	@echo "  PROFILE_EPOCHS=150         Profile-network training epochs"
 	@echo "  DEVICE=auto|cpu|gpu        Training device (default: auto)"
+	@echo "  BATCHSIZE=auto|N           Profile minibatch size (GPU default 64, CPU 16)"
 	@echo "  BMM_DATASET=data/file.nc   Dataset path from repository root"
 	@echo ""
 	@echo "Example:"
@@ -120,13 +122,13 @@ analyse-dataset: julia-instantiate
 
 train-profile: julia-instantiate dirs
 	cd julia && \
-	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) DEVICE=$(DEVICE) \
+	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) DEVICE=$(DEVICE) BATCHSIZE=$(BATCHSIZE) \
 	$(JULIA) --project=. train_surrogate.jl \
 	../$(BMM_DATASET) profile $(PROFILE_EPOCHS) $(SURROGATE_SEED)
 
 train-neuralode: julia-instantiate dirs
 	cd julia && \
-	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) DEVICE=$(DEVICE) \
+	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) DEVICE=$(DEVICE) BATCHSIZE=$(BATCHSIZE) \
 	$(JULIA) --project=. train_surrogate.jl \
 	../$(BMM_DATASET) neuralode $(NEURALODE_EPOCHS) $(SURROGATE_SEED)
 

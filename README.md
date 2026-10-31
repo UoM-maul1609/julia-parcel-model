@@ -14,6 +14,9 @@ make smoke
 make generate
 make analyse
 make train
+
+# Optional: force GPU and choose trajectory minibatch size
+make train DEVICE=gpu BATCHSIZE=64
 make compare
 ```
 
@@ -55,7 +58,8 @@ make setup
 
 ### NVIDIA GPU training
 
-GPU support is optional. On an NVIDIA machine, install CUDA.jl once:
+GPU support is optional. On an NVIDIA machine, install the Julia CUDA packages
+once:
 
 ```bash
 make gpu-setup
@@ -64,7 +68,7 @@ make gpu-check
 
 `gpu-check` should report `CUDA functional = true`.
 
-The current Dense-only surrogate uses CUDA/cuBLAS; cuDNN is not required. The normal CPU environment remains usable on machines without an NVIDIA GPU.
+The normal CPU environment remains usable on machines without an NVIDIA GPU.
 
 ## 2. Build and test BMM
 
@@ -178,7 +182,7 @@ To change the number of epochs:
 make train DEVICE=gpu PROFILE_EPOCHS=250
 ```
 
-The training script loads CUDA at top level (avoiding Julia world-age issues), verifies that it is functional, and reports the selected
+The training script verifies that CUDA is functional and reports the selected
 GPU at startup. The trained parameters are moved back to CPU before evaluation
 and saving, so the resulting checkpoint is portable.
 
@@ -335,3 +339,8 @@ git subtree pull --prefix=bmm bmm-upstream main --squash
 
 Changes to BMM itself should normally be developed in its own repository and
 then pulled into this project as a subtree update.
+
+
+### Training performance
+
+Profile training is minibatched across trajectories and height levels so GPU training uses dense matrix operations. `BATCHSIZE=auto` selects 64 trajectories on GPU and 16 on CPU; override it when benchmarking. The model architecture is expected to evolve, while the `make train` workflow remains stable.

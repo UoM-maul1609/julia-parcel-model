@@ -269,12 +269,10 @@ function _truth_matrix(c::MLCase)
     reduce(hcat, (transformed_target(c, i) for i in eachindex(c.height)))
 end
 
+# GPU-safe single-trajectory loss, retained for diagnostics and NeuralODE use.
 function _trajectory_loss(pred, truth)
     err = pred .- truth
     npt = size(err, 2)
-
-    # Keep reductions GPU-safe: avoid Statistics.mean over 1-D CuArray views,
-    # which falls back to scalar indexing on the host.
     ql_loss   = sum(abs2, err[1:1, :]) / npt
     fact_loss = sum(abs2, err[2:2, :]) / npt
     beta_loss = sum(abs2, err[3:3, :]) / npt
@@ -285,14 +283,207 @@ function _trajectory_loss(pred, truth)
     peak_beta = (maximum(pred[3:3, :]) - maximum(truth[3:3, :]))^2
     peak = (peak_ql + 2.0f0 * peak_fact + peak_beta) / 4f0
 
-    last_err = pred[:, end:end] .- truth[:, end:end]
-    final = sum(abs2, last_err) / length(last_err)
-
+    final_err = pred[:, end:end] .- truth[:, end:end]
+    final = sum(abs2, final_err) / length(final_err)
     point + 0.15f0 * peak + 0.05f0 * final
 end
 
 profile_loss(m::ProfileSurrogate, p, c::MLCase; device=identity) =
     _trajectory_loss(_profile_transformed(m, p, c; device=device), device(_truth_matrix(c)))
+
+"""CPU-side description of one minibatch for the profile surrogate.
+
+All cases in a batch must use the same number of output heights. Modal features
+are concatenated across cases and a small pooling matrix maps modes back to the
+case they belong to. All case x height points are then evaluated in one head
+call. This makes the expensive neural-network work dense and GPU-friendly.
+"""
+struct ProfileBatch
+    mode_features::Matrix{Float32}
+    pool_weights::Matrix{Float32}
+    bulk_features::Matrix{Float32}
+    case_selector::Matrix{Float32}
+    local_features::Matrix{Float32}
+    truth::Matrix{Float32}
+    initial_mask::Matrix{Float32}
+    nheight::Int
+    ncase::Int
+end
+
+function _prepare_profile_batch(cases::AbstractVector{<:MLCase}, m::ProfileSurrogate)
+    isempty(cases) && throw(ArgumentError("empty profile batch"))
+    B = length(cases)
+    nh = length(cases[1].height)
+    all(length(c.height) == nh for c in cases) ||
+        throw(ArgumentError("batched profile training requires a common number of height levels"))
+
+    nmodes = length.(getfield.(cases, :mode_N))
+    ntotal_modes = sum(nmodes)
+    npoints = B * nh
+
+    mode_features = Matrix{Float32}(undef, 4, ntotal_modes)
+    pool_weights = zeros(Float32, ntotal_modes, B)
+    bulk_features = Matrix{Float32}(undef, 6, B)
+    case_selector = zeros(Float32, B, npoints)
+    local_features = Matrix{Float32}(undef, 6, npoints)
+    truth = Matrix{Float32}(undef, 3, npoints)
+    initial_mask = zeros(Float32, 1, npoints)
+
+    moff = 0
+    poff = 0
+    for (j, c) in enumerate(cases)
+        nm = nmodes[j]
+        mr = moff + 1:moff + nm
+        mode_features[:, mr] .= _mode_features(c)
+        pool_weights[mr, j] .= _mode_weights(c)
+        bulk_features[:, j] .= _bulk_features(c)
+
+        pr = poff + 1:poff + nh
+        case_selector[j, pr] .= 1f0
+        for (k, i) in enumerate(eachindex(c.height))
+            hhat = Float32(c.height[i] / m.hscale)
+            local_features[:, poff + k] .= vcat(
+                Float32[forcing_w(c, hhat)],
+                thermo_features(c, i),
+                height_features(hhat),
+            )
+            truth[:, poff + k] .= transformed_target(c, i)
+            initial_mask[1, poff + k] = abs(hhat) <= 1f-7 ? 1f0 : 0f0
+        end
+
+        moff += nm
+        poff += nh
+    end
+
+    ProfileBatch(mode_features, pool_weights, bulk_features, case_selector,
+                 local_features, truth, initial_mask, nh, B)
+end
+
+Zygote.@nograd _prepare_profile_batch
+
+function _profile_batch_transformed(m::ProfileSurrogate, p, batch::ProfileBatch; device=identity)
+    core = m.re(p)
+    mode_features = device(batch.mode_features)
+    pool_weights = device(batch.pool_weights)
+    bulk_features = device(batch.bulk_features)
+    selector = device(batch.case_selector)
+    local_features = device(batch.local_features)
+    initial_mask = device(batch.initial_mask)
+
+    embeddings = core.encoder(mode_features)
+    pooled = embeddings * pool_weights
+    context = vcat(pooled, bulk_features)
+    context_points = context * selector
+    raw = core.head(vcat(context_points, local_features))
+
+    # Keep activation exactly zero at the initial RH=0.95 state without scalar
+    # indexing or mutation of GPU arrays.
+    act = raw[2:2, :] .* (1f0 .- initial_mask) .+ FACT_ZERO_LATENT .* initial_mask
+    vcat(raw[1:1, :], act, raw[3:3, :])
+end
+
+function _profile_batch_loss(m::ProfileSurrogate, p, batch::ProfileBatch; device=identity)
+    pred = _profile_batch_transformed(m, p, batch; device=device)
+    truth = device(batch.truth)
+    B = batch.ncase
+    nh = batch.nheight
+    npoints = B * nh
+
+    err = pred .- truth
+    ql_loss   = sum(abs2, err[1:1, :]) / npoints
+    fact_loss = sum(abs2, err[2:2, :]) / npoints
+    beta_loss = sum(abs2, err[3:3, :]) / npoints
+    point = ql_loss + 2.0f0 * fact_loss + beta_loss
+
+    pred3 = reshape(pred, 3, nh, B)
+    truth3 = reshape(truth, 3, nh, B)
+    peak_err = maximum(pred3; dims=2) .- maximum(truth3; dims=2)
+    peak = (sum(abs2, peak_err[1:1, :, :]) +
+            2.0f0 * sum(abs2, peak_err[2:2, :, :]) +
+            sum(abs2, peak_err[3:3, :, :])) / (4f0 * B)
+
+    final_err = pred3[:, nh:nh, :] .- truth3[:, nh:nh, :]
+    final = sum(abs2, final_err) / (3f0 * B)
+
+    point + 0.15f0 * peak + 0.05f0 * final
+end
+
+function _profile_dataset_loss(m::ProfileSurrogate, p, cases;
+                               batchsize::Int=64, device=identity)
+    isempty(cases) && return NaN
+    total = 0.0
+    n = length(cases)
+    for s in 1:batchsize:n
+        batch_cases = cases[s:min(s + batchsize - 1, n)]
+        batch = _prepare_profile_batch(batch_cases, m)
+        l = _profile_batch_loss(m, p, batch; device=device)
+        total += Float64(l) * length(batch_cases)
+    end
+    total / n
+end
+
+function _train_profile_batched!(p, m::ProfileSurrogate, cases;
+                                 epochs::Int, lr::Real, batchsize::Int,
+                                 val_cases, rng, device=identity,
+                                 grad_clip::Real=10.0, patience::Int=30,
+                                 min_delta::Real=1e-4)
+    isempty(cases) && throw(ArgumentError("no training cases"))
+    batchsize > 0 || throw(ArgumentError("batchsize must be positive"))
+    opt = Flux.setup(Adam(Float32(lr)), p)
+    n = length(cases)
+    best_val = Inf
+    best_p = copy(p)
+    stale = 0
+
+    for ep in 1:epochs
+        perm = randperm(rng, n)
+        total = 0.0
+        for s in 1:batchsize:n
+            ix = perm[s:min(s + batchsize - 1, n)]
+            batch_cases = cases[ix]
+            batch = _prepare_profile_batch(batch_cases, m)
+            loss, grad = Flux.withgradient(p) do theta
+                _profile_batch_loss(m, theta, batch; device=device)
+            end
+            g = grad[1]
+            gnorm = sqrt(sum(abs2, g))
+            if isfinite(gnorm) && gnorm > grad_clip
+                g = g .* Float32(grad_clip / gnorm)
+            end
+            Flux.update!(opt, p, g)
+            total += Float64(loss) * length(ix)
+        end
+
+        trainloss = total / n
+        valloss = (val_cases === nothing || isempty(val_cases)) ? NaN :
+                  _profile_dataset_loss(m, p, val_cases;
+                                        batchsize=max(batchsize, 64), device=device)
+
+        if isfinite(valloss)
+            if valloss < best_val - min_delta
+                best_val = valloss
+                best_p .= p
+                stale = 0
+            else
+                stale += 1
+            end
+        elseif isnan(valloss)
+            best_p .= p
+        end
+
+        if ep == 1 || ep % 5 == 0 || ep == epochs
+            println("profile-v3 epoch $ep/$epochs train=$(round(trainloss,sigdigits=6)) val=$(round(valloss,sigdigits=6))")
+        end
+
+        if isfinite(valloss) && patience > 0 && stale >= patience
+            println("profile-v3 early stopping at epoch $ep; best validation loss=$(round(best_val,sigdigits=6))")
+            break
+        end
+    end
+
+    p .= best_p
+    p
+end
 
 """Solve the v3 Neural ODE in normalized height."""
 function _solve_neuralode(m::NeuralODESurrogate, p, c::MLCase;
@@ -395,9 +586,9 @@ end
 function train_profile!(p, m, cases; epochs=150, lr=7.5e-4, batchsize=16,
                         val_cases=nothing, rng=Random.default_rng(), device=identity,
                         grad_clip=10.0, patience=30)
-    _train_flat!(p, m, cases, profile_loss; epochs=epochs, lr=lr,
-                 batchsize=batchsize, val_cases=val_cases, rng=rng, device=device,
-                 label="profile-v3", grad_clip=grad_clip, patience=patience)
+    _train_profile_batched!(p, m, cases; epochs=epochs, lr=lr,
+                            batchsize=batchsize, val_cases=val_cases, rng=rng,
+                            device=device, grad_clip=grad_clip, patience=patience)
 end
 
 function train_neuralode!(p, m, cases; epochs=40, lr=4e-4, batchsize=4,
