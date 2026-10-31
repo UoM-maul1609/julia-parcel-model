@@ -55,8 +55,7 @@ make setup
 
 ### NVIDIA GPU training
 
-GPU support is optional. On an NVIDIA machine, install the Julia CUDA packages
-once:
+GPU support is optional. On an NVIDIA machine, install CUDA.jl once:
 
 ```bash
 make gpu-setup
@@ -65,7 +64,7 @@ make gpu-check
 
 `gpu-check` should report `CUDA functional = true`.
 
-The normal CPU environment remains usable on machines without an NVIDIA GPU.
+The current Dense-only surrogate uses CUDA/cuBLAS; cuDNN is not required. The normal CPU environment remains usable on machines without an NVIDIA GPU.
 
 ## 2. Build and test BMM
 
@@ -179,7 +178,7 @@ To change the number of epochs:
 make train DEVICE=gpu PROFILE_EPOCHS=250
 ```
 
-The training script verifies that CUDA is functional and reports the selected
+The training script loads CUDA at top level (avoiding Julia world-age issues), verifies that it is functional, and reports the selected
 GPU at startup. The trained parameters are moved back to CPU before evaluation
 and saving, so the resulting checkpoint is portable.
 

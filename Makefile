@@ -93,10 +93,11 @@ clean-bmm:
 julia-instantiate:
 	cd julia && $(JULIA) --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
 
-# Optional NVIDIA training dependencies. This intentionally remains separate
+# Optional NVIDIA training dependency. This intentionally remains separate
 # from `make setup` so the same base environment remains convenient on macOS.
+# The current Dense-only surrogate needs CUDA/cuBLAS, not cuDNN.
 gpu-setup:
-	cd julia && $(JULIA) --project=. -e 'using Pkg; Pkg.add(["CUDA", "cuDNN"]); Pkg.precompile()'
+	cd julia && $(JULIA) --project=. -e 'using Pkg; Pkg.add("CUDA"); Pkg.precompile()'
 
 gpu-check:
 	cd julia && $(JULIA) --project=. -e 'using CUDA; println("CUDA functional = ", CUDA.functional()); CUDA.functional() && CUDA.versioninfo()'
