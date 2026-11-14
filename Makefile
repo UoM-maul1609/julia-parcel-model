@@ -4,6 +4,7 @@
 # This wrapper invokes it but does not modify its Makefiles or source layout.
 
 BMM_DIR ?= bmm
+BAM_DIR ?= bam
 JULIA ?= julia
 
 CASES ?= 256
@@ -36,7 +37,7 @@ else
 BMM_BUILD_ARGS =
 endif
 
-.PHONY: help setup build bmm clean clean-bmm test julia-instantiate julia-test \
+.PHONY: help setup build bmm bam clean clean-bmm clean-bam test julia-instantiate julia-test \
         smoke generate synthetic-pilot analyse analyse-dataset \
         train train-profile train-neuralode compare compare-surrogates dirs \
         gpu-setup gpu-check
@@ -47,7 +48,7 @@ help:
 	@echo ""
 	@echo "Quick start:"
 	@echo "  make setup                 Instantiate the Julia environment"
-	@echo "  make build                 Build BMM (macOS/Linux detected automatically)"
+	@echo "  make build                 Build BMM and BAM"
 	@echo "  make smoke                 Test Julia -> BMM -> NetCDF -> Julia"
 	@echo ""
 	@echo "Main workflow:"
@@ -78,19 +79,25 @@ dirs:
 	@mkdir -p $(DATA_DIR) $(MODEL_DIR) $(RESULTS_DIR) scratch
 
 setup: dirs julia-instantiate
-build: bmm
+build: bmm bam
 test: julia-test
 generate: synthetic-pilot
 analyse: analyse-dataset
 train: train-profile
 compare: compare-surrogates
-clean: clean-bmm
+clean: clean-bmm clean-bam
 
 bmm:
 	$(MAKE) -C $(BMM_DIR) $(BMM_BUILD_ARGS)
 
+bam:
+	$(MAKE) -C $(BAM_DIR)
+
 clean-bmm:
 	$(MAKE) -C $(BMM_DIR) cleanall
+
+clean-bam:
+	$(MAKE) -C $(BAM_DIR) cleanall
 
 julia-instantiate:
 	cd julia && $(JULIA) --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'
@@ -132,8 +139,8 @@ train-neuralode: julia-instantiate dirs
 	$(JULIA) --project=. train_surrogate.jl \
 	../$(BMM_DATASET) neuralode $(NEURALODE_EPOCHS) $(SURROGATE_SEED)
 
-compare-surrogates: julia-instantiate dirs
+compare-surrogates: bam julia-instantiate dirs
 	cd julia && \
-	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) \
+	MODEL_DIR=../$(MODEL_DIR) RESULTS_DIR=../$(RESULTS_DIR) BAM_EXE=../$(BAM_DIR)/main.exe \
 	$(JULIA) --project=. compare_surrogates.jl \
 	../$(BMM_DATASET) $(SURROGATE_SEED) profile $(NPLOTS)

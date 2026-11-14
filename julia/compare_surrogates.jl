@@ -41,6 +41,109 @@ activation_profile(c::MLCase) = Float64[activation_fraction(c, i) for i in eachi
 activation_max(c::MLCase) = maximum(activation_profile(c))
 ntot_cm3_ref(c::MLCase) = sum(c.mode_N) * dry_air_density(c.P0, c.T0, 1.0) / 1e6
 
+# BAM evaluation-only cloud-base activation comparison. The parent Makefile
+# compiles BAM before this script runs.
+const BAM_EXE = abspath(get(ENV, "BAM_EXE", joinpath(@__DIR__, "..", "bam", "main.exe")))
+const BAM_METHODS = [
+    (label="BAM ARG",           method=1, giant=0),
+    (label="BAM FN",            method=2, giant=0),
+    (label="BAM FN + giant",    method=2, giant=1),
+    (label="BAM FN quadrature", method=3, giant=0),
+    (label="BAM Ghosh",         method=4, giant=0),
+]
+
+_fmt_nml(v) = join((@sprintf("%.17g", Float64(x)) for x in v), ", ")
+
+# For sv_flag=0 BAM reduces to B = nu*Mw*rho_core/(Mcore*rho_water).
+# Choose nu from the sampled kappa so BAM and BMM see the same hygroscopicity.
+function _bam_nu_from_kappa(c::MLCase)
+    rho_water = 1000.0
+    mw_water = 18.01528e-3
+    Float64[
+        max(1e-12, Float64(c.mode_kappa[j]) * rho_water / Float64(c.mode_density[j]) *
+                   Float64(c.mode_molw[j]) / mw_water)
+        for j in eachindex(c.mode_N)
+    ]
+end
+
+function _write_bam_namelist(io, c::MLCase; method::Int, giant::Int)
+    nm = length(c.mode_N)
+    nu = _bam_nu_from_kappa(c)
+    println(io, "&bulk_aerosol_setup")
+    println(io, " n_mode = $nm,")
+    println(io, " n_sv = 1,")
+    println(io, " sv_flag = 0,")
+    println(io, " method_flag = $method,")
+    println(io, " giant_flag = $giant,")
+    println(io, " a_eq_7 = 0.21,")
+    println(io, " b_eq_7 = 1.58,")
+    println(io, " ghosh_sigma_mode = 0,")
+    println(io, " ghosh_sigma_acc = 1.6,")
+    println(io, " ghosh_dmin = 80.e-9,")
+    println(io, " ghosh_dmax = 1.e-6")
+    println(io, "/")
+    println(io, "&bulk_aerosol_spec")
+    println(io, " n_aer1(1:$nm) = $(_fmt_nml(c.mode_N)),")
+    println(io, " d_aer1(1:$nm) = $(_fmt_nml(c.mode_Dm)),")
+    println(io, " sig_aer1(1:$nm) = $(_fmt_nml(c.mode_lnsig)),")
+    println(io, " molw_core1(1:$nm) = $(_fmt_nml(c.mode_molw)),")
+    println(io, " density_core1(1:$nm) = $(_fmt_nml(c.mode_density)),")
+    println(io, " nu_core1(1:$nm) = $(_fmt_nml(nu)),")
+    println(io, " org_content1(1) = 0.0,")
+    println(io, " molw_org1(1) = 0.2,")
+    println(io, " density_org1(1) = 1500.0,")
+    println(io, " delta_h_vap1(1) = 0.0,")
+    println(io, " nu_org1(1) = 1.0,")
+    println(io, " log_c_star1(1) = 0.0,")
+    println(io, @sprintf(" p_test = %.17g,", Float64(c.P0)))
+    println(io, @sprintf(" t_test = %.17g,", Float64(c.T0)))
+    println(io, @sprintf(" w_test = %.17g,", Float64(c.w)))
+    println(io, " rand_dist = .false.,")
+    println(io, " n_rand = 1,")
+    println(io, " mean_w = 0.0,")
+    println(io, " sigma_w = 0.0")
+    println(io, "/")
+end
+
+function _parse_bam_output(output::AbstractString, nm::Int)
+    for line in reverse(Base.split(output, '\n'))
+        vals = Float64[]
+        ok = true
+        for token in Base.split(strip(line))
+            try
+                push!(vals, parse(Float64, replace(replace(token, 'D'=>'E'), 'd'=>'e')))
+            catch
+                ok = false
+                break
+            end
+        end
+        ok && length(vals) == nm + 3 && return vals
+    end
+    error("could not parse BAM output:\n$output")
+end
+
+function run_bam(c::MLCase; method::Int, giant::Int=0)
+    isfile(BAM_EXE) || error("BAM executable not found at $BAM_EXE; run `make bam` or `make build`.")
+    nm = length(c.mode_N)
+    mktempdir() do tmp
+        nml = joinpath(tmp, "namelist.in")
+        open(nml, "w") do io
+            _write_bam_namelist(io, c; method=method, giant=giant)
+        end
+        vals = _parse_bam_output(read(`$BAM_EXE $nml`, String), nm)
+        nd_kg = vals[nm+2]
+        rhod_ref = dry_air_density(c.P0, c.T0, 1.0)
+        (Nd_kg=nd_kg,
+         Nd_cm3=nd_kg*rhod_ref/1e6,
+         activation_fraction=vals[nm+3],
+         mode_activation_fraction=vals[2:1+nm])
+    end
+end
+
+bam_predictions(c::MLCase) =
+    Dict(m.label => run_bam(c; method=m.method, giant=m.giant) for m in BAM_METHODS)
+
+
 _fmt_array(v; sigdigits=4) =
     "[" * join((string(round(Float64(x), sigdigits=sigdigits)) for x in v), ", ") * "]"
 
@@ -180,6 +283,27 @@ selected = select_cases(test, nplots)
 outdir = joinpath(results_root, "surrogate_comparison")
 mkpath(outdir)
 
+println("evaluating BAM activation schemes for $(length(test)) held-out cases ...")
+bam_cache = Dict{Int,Dict{String,Any}}()
+for (k, ctest) in enumerate(test)
+    bam_cache[ctest.id] = bam_predictions(ctest)
+    (k == 1 || k % 50 == 0 || k == length(test)) &&
+        println("  BAM: $k/$(length(test))")
+end
+
+bam_csvpath = joinpath(outdir, "bam_activation.csv")
+open(bam_csvpath, "w") do bio
+    println(bio, "case,method,n_modes,w_m_s,T_K,P_hPa,Nd_BAM_cm3,fact_BAM,Ndmax_BMM_cm3,factmax_BMM")
+    for csel in selected
+        for method in BAM_METHODS
+            b = bam_cache[csel.id][method.label]
+            println(bio, join((csel.id, method.label, length(csel.mode_N), csel.w, csel.T0,
+                csel.P0/100, b.Nd_cm3, b.activation_fraction, maximum(csel.Nd)/1e6,
+                activation_max(csel)), ","))
+        end
+    end
+end
+
 open(joinpath(outdir, "selected_cases.txt"), "w") do io
     for c in selected
         @printf(io, "case %d | %d modes | w=%.6g m/s | T=%.4f K | P=%.4f hPa | qtot0=%.6g g/kg | Nref=%.6g cm^-3 | factmax=%.6g\n",
@@ -213,6 +337,14 @@ open(csvpath, "w") do io
                   ylabel="height (m)", linewidth=2, legend=:best, xlims=(-0.02, 1.02))
         pN = plot(Float64.(c.Nd) ./ 1e6, z; label="BMM", xlabel="Nd (cm⁻³)",
                   ylabel="height (m)", linewidth=2, legend=:best)
+        # BAM gives a scalar cloud-base activation result, so show it as a
+        # vertical reference line rather than inventing a height-resolved profile.
+        bam_styles = (:dash, :dot, :dashdot, :dash, :dot)
+        for (ibam, method) in enumerate(BAM_METHODS)
+            b = bam_cache[c.id][method.label]
+            vline!(pN, [b.Nd_cm3]; label=method.label,
+                   linestyle=bam_styles[ibam], linewidth=1.6)
+        end
         pB = plot(Float64.(c.beta_ext), z; label="BMM", xlabel="βext (m⁻¹)",
                   ylabel="height (m)", linewidth=2, legend=:best)
         pQ = plot(1000 .* Float64.(c.ql), z; label="BMM", xlabel="ql (g kg⁻¹)",
@@ -278,7 +410,106 @@ for name in sort(collect(keys(models)))
     savefig(fig, joinpath(outdir, "summary_scatter_$(lowercase(name)).png"))
 end
 
+
+# ---------------------------------------------------------------------------
+# Separate activated-number summary.
+#
+# Compare the surrogate and each BAM activation parameterisation against the
+# maximum activated number produced by BMM for every held-out test case.
+# The normal surrogate summary plot is deliberately left unchanged.
+# ---------------------------------------------------------------------------
+
+nd_bmm = Float64[
+    maximum(c.Nd) / 1e6
+    for c in test
+]
+
+function activation_scatter(xref, ypred, labeltext)
+    lo = min(minimum(xref), minimum(ypred))
+    hi = max(maximum(xref), maximum(ypred))
+
+    # Avoid a degenerate 1:1 line if everything happened to be identical.
+    if hi <= lo
+        hi = lo + 1.0
+    end
+
+    q = scatter(
+        xref,
+        ypred;
+        xlabel="BMM max Nd (cm⁻³)",
+        ylabel="$labeltext Nd (cm⁻³)",
+        title=labeltext,
+        label=false,
+        markersize=3,
+        markerstrokewidth=0
+    )
+
+    plot!(
+        q,
+        [lo, hi],
+        [lo, hi];
+        label="1:1",
+        linestyle=:dash,
+        linewidth=1.5
+    )
+
+    q
+end
+
+activation_panels = Any[]
+
+# Surrogate prediction(s).
+for name in sort(collect(keys(models)))
+    nd_pred = Float64[
+        maximum(cache[name][c.id].Nd) / 1e6
+        for c in test
+    ]
+
+    push!(
+        activation_panels,
+        activation_scatter(nd_bmm, nd_pred, name)
+    )
+end
+
+# BAM cloud-base activation parameterisations.
+for method in BAM_METHODS
+    nd_pred = Float64[
+        bam_cache[c.id][method.label].Nd_cm3
+        for c in test
+    ]
+
+    push!(
+        activation_panels,
+        activation_scatter(nd_bmm, nd_pred, method.label)
+    )
+end
+
+ncols = 3
+nrows = ceil(Int, length(activation_panels) / ncols)
+
+activation_fig = plot(
+    activation_panels...;
+    layout=(nrows, ncols),
+    size=(1450, 430 * nrows),
+    plot_title="Activated number: surrogate and BAM methods against BMM",
+    plot_titlefontsize=12,
+    left_margin=5 * Plots.mm,
+    right_margin=5 * Plots.mm,
+    top_margin=5 * Plots.mm,
+    bottom_margin=5 * Plots.mm,
+    guidefontsize=10,
+    tickfontsize=9
+)
+
+activation_summary_path =
+    joinpath(outdir, "summary_activation_methods.png")
+
+savefig(activation_fig, activation_summary_path)
+println("wrote ", activation_summary_path)
+
+
 println("\nwrote ", csvpath)
+println("wrote ", bam_csvpath)
 println("wrote ", joinpath(outdir, "selected_cases.txt"))
 println("selected test cases:")
 for c in selected
