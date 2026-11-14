@@ -1,0 +1,13 @@
+*.o
+*.mod
+*.a
+*.so
+*.exe
+*~
+doxygen
+matlab
+namelist.andreas
+.DS_Store
+__pycache__
+
+
