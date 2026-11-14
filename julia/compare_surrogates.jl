@@ -226,6 +226,14 @@ for (name, obj) in models
     cache[name] = pc
 end
 
+function rsquared(x, y)
+    xx = Float64.(x)
+    yy = Float64.(y)
+    ss_res = sum((yy .- xx).^2)
+    ss_tot = sum((xx .- mean(xx)).^2)
+    ss_tot > 0 ? 1 - ss_res / ss_tot : NaN
+end
+
 function metrics(subset, pcache)
     isempty(subset) && return nothing
     seS=0.0; seQ=0.0; seF=0.0; aeF=0.0; seN=0.0; seB=0.0
@@ -340,11 +348,6 @@ open(csvpath, "w") do io
         # BAM gives a scalar cloud-base activation result, so show it as a
         # vertical reference line rather than inventing a height-resolved profile.
         bam_styles = (:dash, :dot, :dashdot, :dash, :dot)
-        for (ibam, method) in enumerate(BAM_METHODS)
-            b = bam_cache[c.id][method.label]
-            vline!(pN, [b.Nd_cm3]; label=method.label,
-                   linestyle=bam_styles[ibam], linewidth=1.6)
-        end
         pB = plot(Float64.(c.beta_ext), z; label="BMM", xlabel="βext (m⁻¹)",
                   ylabel="height (m)", linewidth=2, legend=:best)
         pQ = plot(1000 .* Float64.(c.ql), z; label="BMM", xlabel="ql (g kg⁻¹)",
@@ -396,7 +399,10 @@ for name in sort(collect(keys(models)))
 
     function scatter_one(x, y, xlabeltext, ylabeltext, ttl)
         lo = min(minimum(x), minimum(y)); hi = max(maximum(x), maximum(y))
-        q = scatter(x, y; xlabel=xlabeltext, ylabel=ylabeltext, title=ttl,
+        r2 = rsquared(x, y)
+        n = length(x)
+        titletext = @sprintf("%s\nR² = %.3f, n = %d", ttl, r2, n)
+        q = scatter(x, y; xlabel=xlabeltext, ylabel=ylabeltext, title=titletext,
                     label="test cases", markersize=4)
         plot!(q, [lo, hi], [lo, hi]; label="1:1", linestyle=:dash)
         q
@@ -428,6 +434,10 @@ function activation_scatter(xref, ypred, labeltext)
     lo = min(minimum(xref), minimum(ypred))
     hi = max(maximum(xref), maximum(ypred))
 
+    r2 = rsquared(xref, ypred)
+    n = length(xref)
+    titletext = @sprintf("%s\nR² = %.3f, n = %d", labeltext, r2, n)
+
     # Avoid a degenerate 1:1 line if everything happened to be identical.
     if hi <= lo
         hi = lo + 1.0
@@ -438,7 +448,7 @@ function activation_scatter(xref, ypred, labeltext)
         ypred;
         xlabel="BMM max Nd (cm⁻³)",
         ylabel="$labeltext Nd (cm⁻³)",
-        title=labeltext,
+        title=titletext,
         label=false,
         markersize=3,
         markerstrokewidth=0

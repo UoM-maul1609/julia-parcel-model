@@ -344,3 +344,53 @@ then pulled into this project as a subtree update.
 ### Training performance
 
 Profile training is minibatched across trajectories and height levels so GPU training uses dense matrix operations. `BATCHSIZE=auto` selects 64 trajectories on GPU and 16 on CPU; override it when benchmarking. The model architecture is expected to evolve, while the `make train` workflow remains stable.
+
+
+## Bulk Activation Module (BAM)
+
+The repository also contains `bam/`, the Bulk Activation Module, as an external git subtree alongside `bmm/`.
+
+BMM is the high-fidelity parcel/bin-microphysics reference used to generate the surrogate training and test data. BAM is used only as an independent cloud-activation benchmark during evaluation.
+
+The top-level build command builds both external models:
+
+    make build
+
+They can also be built individually:
+
+    make bmm
+    make bam
+
+`make compare` ensures BAM is built before running the surrogate evaluation.
+
+The BAM activation schemes currently compared are:
+
+- Abdul-Razzak and Ghan (ARG)
+- Fountoukis and Nenes (FN)
+- FN with giant-CCN treatment
+- FN using quadrature
+- Ghosh-modified ARG
+
+BAM predicts a scalar cloud-base activated number rather than a height-resolved parcel trajectory. It is therefore not plotted on the individual `case_XXXX.png` vertical-profile figures.
+
+Instead, the full held-out test set is compared in:
+
+    results/surrogate_comparison/summary_activation_methods.png
+
+BAM numerical results are also written to:
+
+    results/surrogate_comparison/bam_activation.csv
+
+For the synthetic kappa-based aerosol ensemble, the comparison code converts the sampled kappa to the equivalent BAM solute parameter so that BMM and BAM use consistent aerosol hygroscopicity.
+
+### Updating the external subtrees
+
+With remotes named `bmm` and `bam`:
+
+    git fetch bmm
+    git subtree pull --prefix=bmm bmm main --squash
+
+    git fetch bam
+    git subtree pull --prefix=bam bam main --squash
+
+The contents of `bmm/` and `bam/` should be treated as upstream code and should not normally be reorganised inside this parent repository.
